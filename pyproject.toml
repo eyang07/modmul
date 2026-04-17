@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modchallenge"
+version = "0.1.0"
+description = "Evaluation system for the Modular Arithmetic Challenge"
+requires-python = ">=3.12"
+dependencies = [
+    "sympy>=1.12",
+    "pydantic>=2.0",
+    "huggingface-hub>=0.20",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+sandbox = [
+    "docker>=7.0",
+]
+
+[project.scripts]
+modchallenge = "modchallenge.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

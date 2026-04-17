@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv*/
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+*.DS_Store
+
+# Internal dev context (not for contestants)
+CLAUDE.md
+
+# External dependencies (cloned separately)
+axolver/
+
+# Model caches (HF downloads)
+.cache/
+
+# Leaderboard state
+leaderboard.json
+
+# Model weights and checkpoints (all models live on HuggingFace)
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.onnx
