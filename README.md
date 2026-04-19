@@ -87,3 +87,7 @@ Tier 0 covers the full operand range (10 sub-levels from 1-digit to 1233-digit) 
 - 5 different primes per tier to prevent overfitting
 - Edge cases: a=0, b=0, a=1, b=1 in every tier
 - Public benchmark uses a fixed seed so results are reproducible
+
+## Organizers
+
+Alberto Alferano, Francois Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger
