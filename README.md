@@ -91,3 +91,23 @@ Tier 0 covers the full operand range (10 sub-levels from 1-digit to 1233-digit) 
 ## Organizers
 
 Alberto Alferano, Francois Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger
+
+## Literature
+
+Note: this bibliography is not intended to be comprehensive.
+
+- François Charton, Julia Kempe. [Emergent Properties with Repeated Examples](https://arxiv.org/pdf/2410.07041).
+
+- Darshil Doshi, Tianyu He, Aritra Das, Andrey Gromov. [Grokking modular polynomials](https://arxiv.org/pdf/2406.03495). 
+
+- Andrey Gromov. [Grokking modular arithmetic](https://arxiv.org/pdf/2301.02679).
+
+- Tianyu He, Darshil Doshi, Aritra Das, Andrey Gromov. Learning to grok: Emergence of in-context learning and skill composition in modular arithmetic tasks. Proceedings of the 36th Conference on Neural Information Processing Systems (NeurIPS), 2024.
+
+- Kristin Lauter, Cathy Y. Li, Krystal Maughan, Rachel Newton, Megha Srivastava. Machine Learning for Modular Multiplication. Research Directions in Number Theory (Springer 978-3-032-11182-1).
+
+- Alethea Power, Yuri Burda, Harri Edwards, Igor Babuschkin, Vedant Misra. [Grokking: Generalization Beyond Overfitting on Small Algorithmic Datasets](https://arxiv.org/pdf/2201.02177)
+
+- Eshika Saxena, Alberto Alfarano, François Charton, Zeyuan Allen-Zhu, Emily Wenger, Kristin Lauter. [Making Hard Problems Easier with Custom Data Distributions and Loss Regularization: A Case Study in Modular Arithmetic](https://arxiv.org/pdf/2410.03569).
+- 
+- Emily Wenger, Mingjie Chen, François Charton, Kristin Lauter. SALSA: Attacking Lattice Cryptography with Transformers. Proceedings of the 36th Conference on Neural Information Processing Systems (NeurIPS), 2022.
