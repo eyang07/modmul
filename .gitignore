@@ -23,6 +23,9 @@ htmlcov/
 # Internal dev context (not for contestants)
 CLAUDE.md
 
+# Reference rules from sibling competitions (kept locally for drafting)
+rules/reference/
+
 # External dependencies (cloned separately)
 axolver/
 

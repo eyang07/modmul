@@ -4,7 +4,7 @@ Can a neural network learn modular multiplication?
 
 Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. Operands can be hundreds of digits long — far beyond what fits in a 64-bit integer. Your model must learn to compute the answer without symbolic math libraries or built-in arbitrary-precision arithmetic.
 
-See **[RULES.md](RULES.md)** for full competition rules, background, scoring, and submission workflow.
+See **[rules/overview.md](rules/overview.md)** for full competition rules, background, scoring, and submission workflow. For evaluation details (sandbox, test generation, time and resource budgets) see **[rules/evaluation.md](rules/evaluation.md)**, and for related prior work see **[rules/literature.md](rules/literature.md)**.
 
 This repository contains the open-source evaluation system used for both local testing and official evaluation.
 
@@ -42,7 +42,10 @@ examples/
   examples.json       Model registry (public + private HF repos)
   tutorial.md         Step-by-step guide from setup to submission
 
-RULES.md            Competition rules, background, and scoring
+rules/
+  overview.md       Competition rules, background, scoring, anti-cheating policy
+  evaluation.md     Evaluation setup, sandbox, test generation, scoring details
+  literature.md     Bibliography of related prior work
 public_benchmark/   1100 test cases (fixed seed, answers included)
 tests/              pytest test suite
 ```
