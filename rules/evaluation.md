@@ -20,7 +20,7 @@ A submission is a **single HuggingFace repository** identified by `repo_id` + an
 | Limit | Reference value |
 |-------|-----------------|
 | Total artifact size (weights + code + all files) | **20 GB** |
-| Total inference time for the full evaluation set | **5 minutes** for 1100 problems (TBD; final value confirmed before competition opens) |
+| Total inference time for the full evaluation set | **5 minutes** for 1100 problems (TBD; subject to community input) |
 
 The repository may be private during development and must be made **public** before the official submission deadline. Private repositories are not ranked on the official leaderboard.
 
@@ -48,9 +48,24 @@ class MyModel(ModularMultiplicationModel):
         return 64
 ```
 
-Inputs are decimal strings of arbitrary length (`a >= 0`, `b >= 0`, `p >= 2` prime). The output must be a decimal string equal to `(a * b) mod p`.
+Inputs are decimal strings of arbitrary length (`a >= 0`, `b >= 0`, `p >= 2` prime). The output must be a canonical decimal string equal to `(a * b) mod p` (full output specification in **Output Format** below).
 
-Any architecture, tokenization, and preprocessing strategy is allowed, subject to the restrictions in **Prohibited Practices** below.
+The decimal-string boundary is the **only** fixed contract. Inside `predict` (and `predict_batch`) you may use any internal representation — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings, etc. Encoding the inputs into your representation and decoding the model's output back to a decimal string both happen inside your code. See **Prohibited Practices** below for the boundary between *re-encoding* (allowed) and *computing the answer outside the model* (prohibited).
+
+Any architecture implementable within the supported sandbox runtime is allowed, subject to the restrictions in **Prohibited Practices** below.
+
+## Output Format
+
+The output of `predict()` (and each element of `predict_batch()`) must be a **canonical decimal string** representing `(a * b) mod p`:
+
+- digits `0`-`9` only
+- no leading zeros, except for the literal string `"0"` representing zero
+- no whitespace, no signs, no separators, no scientific notation
+- type must be `str` (not `None`, not `bytes`, not `int`)
+
+Outputs that violate the canonical format are scored as **incorrect** for that problem. They do not raise an error and do not abort the run.
+
+**Batch contract:** if `predict_batch(inputs)` returns a list whose length differs from `len(inputs)`, the entire tier is marked incomplete and scores **0%**. The pipeline does not attempt to re-align partial results.
 
 ## Submission Workflow
 
@@ -78,7 +93,7 @@ modchallenge evaluate ./my-local-model --total 110
 4. Organizers run official evaluation in the sandboxed environment with a **secret random seed**.
 5. Results are posted to the leaderboard.
 
-Multiple submissions per team are allowed; each submission is locked by its commit hash, and the leaderboard keeps the best result per team.
+Multiple submissions per team are allowed; each submission is locked by its commit hash. The leaderboard keeps the best result **per team** (not per repo); see [overview.md](overview.md#team-participation-and-anti-cheating-policy) for how team identity is bound to HuggingFace accounts at registration time.
 
 ## Solver Environment
 
@@ -104,7 +119,7 @@ The pipeline runs three steps for each submission:
 2. **Inference** — run the model over all problems, batched up to `max_batch_size()` where applicable.
 3. **Determinism check** — re-run a sampled subset of problems and compare outputs; nondeterministic submissions are flagged and excluded from the ranked leaderboard.
 
-The full pipeline is implemented in `src/modchallenge/evaluation/pipeline.py` and is identical between local testing and official evaluation.
+The pipeline is implemented in `src/modchallenge/evaluation/pipeline.py` and is shared between local testing and official evaluation. Official evaluation additionally executes the model inside the sandbox described in **Solver Environment**; local testing via `modchallenge evaluate-hf` currently runs the model in the host process (trusted-use only). Apart from the sandbox boundary and the package allowlist that comes with it, the test-generation, inference loop, scoring, and determinism check are the same code path in both settings.
 
 ## Test Generation
 
@@ -142,12 +157,20 @@ The single source of truth for tier geometry is `src/modchallenge/config.py`.
 
 ## Scoring
 
-- **Primary metric:** `overall_accuracy` = average accuracy across Tiers 1-10, with **equal weight per tier**.
-- **Secondary metric:** `highest_tier_above_90` = the highest tier index at which accuracy `>= 90%`.
-- **Tier 0:** diagnostic only; not counted toward the score.
-- **Incomplete tiers:** tiers that fail to complete (timeout, error, crash) score 0% for that tier.
+**Reported metrics** (computed for every submission):
 
-**Leaderboard ranking:** first by `highest_tier_above_90` (descending), then by `overall_accuracy` as tiebreaker. Final scoring rules and tiebreakers are subject to community feedback before the competition officially opens.
+- `overall_accuracy` — average accuracy across Tiers 1-10, with **equal weight per tier**.
+- `highest_tier_above_90` — the highest tier index at which accuracy `>= 90%`.
+
+**Leaderboard ranking keys** (sort order):
+
+1. `highest_tier_above_90` (descending)
+2. `overall_accuracy` (descending) as tiebreaker
+
+**Tier 0** is diagnostic only and is not counted toward either metric.
+**Incomplete tiers** (timeout, error, crash, batch-contract failure) score 0% for that tier.
+
+Final scoring rules and tiebreakers are subject to community feedback.
 
 ## Determinism Requirement
 
@@ -163,35 +186,74 @@ If a model uses any source of randomness internally (sampling, dropout at infere
 |----------|-----------------|-------|
 | Total inference wall-clock | 5 minutes for 1100 problems | TBD; may be tuned. |
 | Per-problem soft target | ~273 ms | Use `predict_batch()` and GPU batching to amortize. |
+| `load()` budget | TBD | Bounded separately; not counted against the inference wall-clock. |
+| Determinism check | TBD | Bounded separately; not counted against the inference wall-clock. |
 | Total artifact size | 20 GB | Weights + code + all files. |
 | Memory | TBD | Will be set based on chosen evaluation hardware. |
 
-A submission that exceeds the wall-clock budget for a tier scores 0% on that tier.
+**Wall-clock measurement (mechanical policy):**
+
+- The inference timer **starts** when the pipeline issues the first `predict_batch` call after `load()` completes.
+- The timer **excludes** `load()` (separate bounded budget) and the determinism check (separate bounded budget on a small sample).
+- Tiers run in order: Tier 0 first, then Tiers 1, 2, ..., 10.
+- **On timeout:**
+  - The tier currently being processed scores **0%**; partial results within that tier are discarded.
+  - All subsequent tiers score **0%**.
+  - Tiers fully completed before the timeout retain their actual scores.
 
 ## Prohibited Practices
 
+The principle: **the model must learn to compute `(a * b) mod p`. It may not delegate, look up, or hard-code the computation.**
+
 The following are **not allowed at inference time**:
 
-- Symbolic-math libraries: `sympy`, `gmpy2`, `mpmath`, `flint`, etc.
-- Using Python's built-in arbitrary-precision integer arithmetic to compute the answer directly (e.g. `str(int(a) * int(b) % int(p))`).
-- `eval`, `exec`, `compile`, `__import__` of arbitrary modules, or any other dynamic code generation used to perform the computation.
+- **Computing the final answer** `(a * b) mod p` using:
+  - symbolic-math libraries: `sympy`, `gmpy2`, `mpmath`, `flint`, etc.
+  - Python's built-in arbitrary-precision integer arithmetic on the full operands (e.g. `str(int(a) * int(b) % int(p))`)
+- **Hard-coding** test answers, lookup tables indexed by the evaluation inputs, or fingerprints / hashes of the evaluation set into the model weights or code.
+- Dynamic code execution: `eval`, `exec`, `compile`, `__import__` of arbitrary modules, `ctypes`, or any other mechanism used to load or execute computation outside the model.
 - Network access of any kind.
 - Reading files outside the submission directory (other than standard runtime libraries on `sys.path`).
 - Spawning subprocesses or invoking system commands.
-- Hard-coding test answers or fingerprints of the evaluation set into the model or code.
 
-The model must **learn** to compute modular multiplication. It may not delegate the computation to an external library, an external service, or a hard-coded lookup table indexed by the evaluation inputs.
+**Explicitly allowed: representation conversion.** Using `int()`, modular arithmetic on small intermediate quantities, base conversion, p-adic decomposition, CRT splitting, byte-level encoding, or any other standard transformation to **re-encode** inputs into your model's internal representation, or to **decode** the model's output back to a decimal string, is **not a violation**.
 
-**Enforcement:**
+**Structural test for the boundary.** The issue is not how the code is spelled but where the answer comes from. If pre- or post-processing code combines information from `a`, `b`, **and** `p` to derive part of the final residue digits — whether by chunked / streaming multiplication, Karatsuba, CRT recombination of model outputs against `p`, or any other algorithm — it is treated as *computing the answer outside the model*, even if no expression of the form `int(a) * int(b) % int(p)` ever appears. The model's output must materially determine the answer digits; conversion code must be representational only, not computational.
 
-- The official evaluation runs in a sandboxed environment that enforces network, filesystem, and subprocess restrictions.
-- Submissions are subject to organizer review (manual reading of `model.py` and any auxiliary code).
-- Planned additional checks: static analysis for prohibited imports, weight-perturbation tests for memorization detection, and timing analysis. Details: TBD.
-- Any submission found to violate these rules is disqualified and removed from the leaderboard.
+Borderline examples (allowed):
+
+- `int(a)` to parse the decimal string into a Python int as a step in computing its base-`q` digits — uses only `a`, no combination with `b` or `p`
+- `int(p) % q` to set up CRT moduli — uses only `p`, no combination with `a` or `b`
+- a base-`b` representation of `a` and `b` fed to the model, with the answer reconstructed digit-by-digit from the model's output — the model output materially determines the answer
+- the model emits the answer as CRT residues (or any other representation), and the post-processor deterministically decodes those residues into the canonical decimal string — decoding consumes only the model output (and `p` for canonicalization), not `a` or `b`
+
+Borderline examples (prohibited):
+
+- Computing `int(a) * int(b) % int(p)` and then "encoding" it as the answer
+- A neural model whose forward pass returns garbage but whose output post-processor computes the answer from `int(a)`, `int(b)`, `int(p)` regardless of the model output
+- Splitting `a` and `b` into chunks, asking the model only for individual chunk products, and recombining them modulo `p` in the post-processor — the recombination is the modular multiplication, not the model
+- The post-processor computes CRT residues itself from `int(a)`, `int(b)` against small prime factors and uses those residues — residues come from the algorithm, not the model
+- Per-prime-factor CRT in the post-processor: model produces residues against small primes, post-processor recombines using `p` — recombination is the answer
+
+The principle is symmetric: **decoding model-produced residues / digits / encodings into the answer is fine; computing residues or the final modular product from `a`, `b`, `p` outside the model is not.**
+
+**Enforcement layers** (the design below is the target for the official evaluation; layers marked *planned* are under active development and will be published as the implementation matures, in time for the official evaluation runs):
+
+1. **Sandbox package allowlist** *(planned)*. The evaluation sandbox is a published Docker image whose package list will be fixed and disclosed as soon as the image is finalized, so contestants can build and test against it during the competition window. The runtime initially centers on PyTorch; broader runtime support (JAX, TensorFlow, ONNX, etc.) may be added based on contestant demand. The image will not include `sympy`, `gmpy2`, `mpmath`, `flint`, or networking / subprocess libraries; `import` of any package not in the image fails at load time. Any further restrictions on the Python stdlib (if needed) will be listed in the published image spec.
+2. **Static analysis** *(planned)*. Every submission's source is AST-scanned before evaluation. The scanner flags disallowed imports, calls to `eval` / `exec` / `compile` / `__import__` / `ctypes`, and obvious patterns of computing the modular product from `(a, b, p)` directly (e.g. `int(_) * int(_) % int(_)` and arithmetic equivalents). Submissions matching these patterns are rejected before the model is loaded. Static analysis is intentionally narrow — it catches the easy cases; subtler code paths (e.g. chunked multiplication, CRT recombination in post-processing) are caught by Layer 4.
+3. **Behavioral signals for review** *(planned)*. Submissions may be subject to investigative checks that produce **signals for organizer review**, not automatic disqualification:
+   - **Weight perturbation**: random small perturbation of the model weights; if accuracy is essentially unchanged, the model may not be using its weights to produce the answer. *Caveat:* this can miss code-based solvers and may false-flag fragile or aggressively quantized models.
+   - **Distribution shift**: re-evaluation on a separately seeded test set drawn from the same distribution; large divergence from the official score is a possible indicator of over-fitting to a leaked seed. *Caveat:* legitimate models can also show non-trivial variance.
+   - **Latency profile**: per-problem inference time vs operand size; an essentially flat curve across tiers is a possible indicator of a constant-time shortcut. *Caveat:* aggressive batching can flatten the curve for legitimate models.
+
+   These checks inform the manual review in Layer 4 — they do not by themselves disqualify a submission.
+4. **Manual code review.** Required for top leaderboard entries and any submission flagged by Layer 2 (static analysis) or Layer 3 (behavioral signals). The reviewer reads `model.py` and any auxiliary code, applying the **structural test** above to decide whether the submission is computing the answer in the model or outside it.
+
+Any submission found to violate the rules is disqualified and removed from the leaderboard.
 
 ## Evaluation Hardware
 
-**TBD.** The evaluation pipeline supports CPU, CUDA, and Apple MPS backends. The official evaluation hardware (CPU model, GPU model, memory, disk) and the corresponding per-tier wall-clock budget will be announced before the competition officially opens.
+**TBD.** The evaluation pipeline supports CPU, CUDA, and Apple MPS backends. The official evaluation hardware (CPU model, GPU model, memory, disk) and the corresponding per-tier wall-clock budget will be announced before the official evaluation runs.
 
 ## Evaluation Problem Sets
 

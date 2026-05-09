@@ -12,8 +12,10 @@ from abc import ABC, abstractmethod
 class ModularMultiplicationModel(ABC):
     """Abstract base class that all submissions must implement.
 
-    Input/output are decimal strings to support primes up to ~2^2000.
-    Tokenization strategy is entirely up to the contestant.
+    The predict() boundary takes decimal strings (a, b, p) and returns
+    a decimal string. The internal representation used inside the model
+    -- digit-level tokens, p-adic, CRT decomposition, other bases, custom
+    embeddings, etc. -- is entirely up to the contestant.
     """
 
     @abstractmethod

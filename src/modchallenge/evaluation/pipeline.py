@@ -175,21 +175,20 @@ def evaluate_local(
     test_set = generate_private_test_set(master_seed=master_seed, config=config)
 
     logger.info("Loading model...")
-    wall_start = time.monotonic()
+    load_start = time.monotonic()
     model = load_model(model_dir, manifest)
-    load_time = time.monotonic() - wall_start
+    load_time = time.monotonic() - load_start
     logger.info("Model loaded in %.1fs", load_time)
 
+    det_start = time.monotonic()
     is_deterministic = check_determinism(model, test_set)
-    det_time = time.monotonic() - wall_start - load_time
+    det_time = time.monotonic() - det_start
     if not is_deterministic:
         logger.warning("Model is NON-DETERMINISTIC. Results will not be ranked.")
     logger.info("Determinism check in %.1fs", det_time)
 
-    elapsed_so_far = time.monotonic() - wall_start
-    remaining_time = max(0.0, config.timeout_seconds - elapsed_so_far)
-    logger.info("Running inference (%.1fs remaining)...", remaining_time)
-    predictions = run_inference(model, test_set, timeout_seconds=remaining_time)
+    logger.info("Running inference (%.1fs budget)...", config.timeout_seconds)
+    predictions = run_inference(model, test_set, timeout_seconds=config.timeout_seconds)
 
     result = score_full_in_memory(test_set, predictions)
     result.deterministic = is_deterministic

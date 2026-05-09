@@ -26,6 +26,9 @@ CLAUDE.md
 # Reference rules from sibling competitions (kept locally for drafting)
 rules/reference/
 
+# Claude Code internal state
+.claude/
+
 # External dependencies (cloned separately)
 axolver/
 

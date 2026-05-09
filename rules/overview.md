@@ -1,7 +1,5 @@
 # Modular Arithmetic Challenge
 
-*(Alberto Alferano, Francois Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger)*
-
 ## What is This Competition?
 
 The Modular Arithmetic Challenge asks a simple question: **can a neural network learn to do modular multiplication?**
@@ -12,7 +10,7 @@ This sounds trivial for a calculator. For a neural network, it is an open proble
 
 ## Organizers
 
-Alberto Alferano, Francois Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger
+Alberto Alfarano, François Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger
 
 ## Background
 
@@ -59,7 +57,7 @@ a = "123456789", b = "987654321", p = "97"
 answer = "52"   # because (123456789 * 987654321) % 97 == 52
 ```
 
-This is a pure mathematical reasoning challenge. No internet access, no external APIs, no symbolic math libraries at inference time. Your model must learn to compute the answer.
+This is a pure mathematical reasoning challenge. The decimal-string input/output is the official contract. **Internally your model may use any representation** — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings — as long as the function from decimal `(a, b, p)` to decimal answer is performed by your model, not delegated to an external library. See **Prohibited Practices** below for the precise boundary.
 
 For the breakdown of difficulty tiers, the test-generation procedure, and the scoring rules used by the official evaluation, see [evaluation.md](evaluation.md).
 
@@ -67,19 +65,17 @@ For the breakdown of difficulty tiers, the test-generation procedure, and the sc
 
 | Event | Date |
 |-------|------|
-| Competition opens | TBD |
-| Contributor Network sharing opens | TBD |
-| Submission deadline | TBD |
-| Final evaluation and results | TBD |
+| Competition opens | May 12, 2026 |
+| Submission deadline | September 30, 2026, 23:59 AoE |
 
 ## Model Requirements
 
-- Submissions must implement the `ModularMultiplicationModel` Python interface.
+- Submissions must implement the `ModularMultiplicationModel` Python interface. The `predict()` boundary takes the canonical decimal strings `(a, b, p)` and returns the canonical decimal answer; encoding and decoding inside the model is your choice.
 - Submissions must be deterministic.
-- Any architecture is allowed: Transformer, RNN, CNN, hybrid, or novel approaches.
-- Any tokenization strategy is allowed: digit-level, BPE, p-adic, CRT decomposition, etc.
+- Any architecture **implementable within the supported sandbox runtime** is allowed: Transformer, RNN, CNN, hybrid, or novel approaches. The runtime contract (initially centered on PyTorch; broader runtime support such as JAX, TensorFlow, ONNX may be added based on contestant demand) is documented in [evaluation.md](evaluation.md).
+- Any internal representation of inputs and outputs is allowed: digit-level tokens, p-adic, CRT decomposition, other bases, learned embeddings, etc.
 
-The interface signature, required file layout, artifact size limit, and inference time budget are specified in [evaluation.md](evaluation.md).
+The interface signature, required file layout, artifact size limit, output format, and inference time budget are specified in [evaluation.md](evaluation.md).
 
 ## Submission Workflow
 
@@ -96,30 +92,47 @@ A submission is a **public HuggingFace repository** containing your model, ident
 - The commit hash locks the submission version immutably.
 - Multiple submissions are allowed; the leaderboard keeps your best result per team.
 - Official evaluation uses a secret random seed unknown to contestants.
-- The evaluation logic (test generation, scoring, tier definitions) is open source and identical between local testing and official evaluation. Official evaluation additionally runs in a sandboxed environment.
+- The test-generation, scoring, and model-interface code is open source and shared by both local testing and official evaluation. Official evaluation additionally runs inside the sandboxed environment described in [evaluation.md](evaluation.md), so the two setups differ in sandbox enforcement and in the available package surface — contestants should test their submission against the published sandbox image before final submission.
 
 For local testing during development (including the option of using a private HF repo with a read-only token) and full evaluation details, see [evaluation.md](evaluation.md).
 
 ## Prohibited Practices
 
-The following are **not allowed** at inference time:
+The prohibitions below all share one principle: **the model must learn to compute `(a * b) mod p`; it may not delegate, look up, or hard-code the computation.**
 
-- Using symbolic math libraries (`sympy`, `gmpy2`, `mpmath`, etc.)
-- Using Python's built-in arbitrary-precision arithmetic to compute the answer directly (`int(a) * int(b) % int(p)`)
-- Using `eval()`, `exec()`, or dynamic code generation to perform computation
+The following are **not allowed at inference time**:
+
+- **Computing the final answer** `(a * b) mod p` using symbolic-math libraries (`sympy`, `gmpy2`, `mpmath`, `flint`, etc.) or Python's built-in arbitrary-precision integer arithmetic (e.g. `int(a) * int(b) % int(p)`)
+- **Hard-coded answers** or lookup tables indexed by the evaluation inputs (or by hashes/fingerprints of them)
+- Dynamic code execution: `eval`, `exec`, `compile`, `__import__`, `ctypes`
 - Network access of any kind
-- Reading files outside your submission directory
+- Reading files outside the submission directory
 - Subprocess calls or system commands
 
-Your model must **learn** to compute modular multiplication, not hard-code or delegate the computation.
+**What is explicitly allowed:** using `int()`, base conversion, modular arithmetic on small intermediate values, or other standard operations to **convert representations** (decimal ↔ p-adic, decimal ↔ CRT components, decimal ↔ other bases, etc.) is fine. Pre-/post-processing, tokenization, and decoding all fall on the allowed side.
 
-Submissions found to violate these rules will be disqualified. Sandbox configuration, code review, and the planned anti-memorization checks are documented in [evaluation.md](evaluation.md).
+**Structural test for the boundary.** The issue is not how the code is spelled but where the answer comes from. If pre- or post-processing code combines information from `a`, `b`, **and** `p` to derive part of the final residue digits — whether by chunked / streaming multiplication, Karatsuba, CRT recombination of model outputs against `p`, or any other algorithm — it is treated as *computing the answer outside the model*, even if no expression of the form `int(a) * int(b) % int(p)` ever appears. The model's output must materially determine the answer digits; conversion code must be representational only, not computational.
+
+Submissions found to violate these rules will be disqualified. Sandbox configuration, static-analysis checks, and the planned behavioral signals (weight perturbation, distribution shift, latency profile) are documented in [evaluation.md](evaluation.md).
 
 ## Team Participation and Anti-Cheating Policy
 
+**Team registration:**
+
 - Each individual or organization can participate in only one team.
-- Teams must register members and sponsors in advance.
-- If coordinated cheating is detected (including sockpuppet teams), all related teams will be disqualified.
+- Teams must register members and sponsors with organizers in advance (registration portal: TBD).
+- At registration, a team declares one or more HuggingFace accounts or organizations as their submission identities.
+
+**Team identity binding:**
+
+- A submission is attributed to a team if its `repo_id` is owned by one of that team's declared HuggingFace accounts or organizations.
+- A team may submit from multiple repositories across any of their declared accounts.
+- Leaderboard deduplication is **per team**, not per repo: the leaderboard keeps each team's best result across all their submissions, regardless of source repo or account.
+- Repo ownership is verified against the team's declared accounts at submission time.
+
+**Anti-cheating:**
+
+- If coordinated cheating is detected — including sockpuppet teams, weight laundering across accounts, or hard-coding of evaluation answers — all related teams will be disqualified.
 
 ## SAIR Contributor Network
 
@@ -145,4 +158,4 @@ Join the SAIR Foundation Zulip community for discussion and collaboration:
 
 ## Experimental Status
 
-This challenge is currently in an experimental phase. Rules, scoring details, and evaluation procedures may be adjusted based on implementation experience and community feedback. Items marked **TBD** in this document will be confirmed before the competition officially opens.
+This challenge is currently in an experimental phase. Rules, scoring details, and evaluation procedures may be adjusted based on implementation experience and community feedback. Items marked **TBD** in this document are open questions where we explicitly welcome community input — see **Community Feedback** above for where to weigh in.

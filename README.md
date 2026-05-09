@@ -2,7 +2,7 @@
 
 Can a neural network learn modular multiplication?
 
-Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. Operands can be hundreds of digits long — far beyond what fits in a 64-bit integer. Your model must learn to compute the answer without symbolic math libraries or built-in arbitrary-precision arithmetic.
+Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. Operands can be hundreds of digits long — far beyond what fits in a 64-bit integer. Your model must **learn** to compute the answer — it may not delegate the modular product to symbolic-math libraries or to Python's built-in arbitrary-precision arithmetic. (Using those for representation conversion is fine; see [rules/overview.md](rules/overview.md#prohibited-practices) for the precise boundary.)
 
 See **[rules/overview.md](rules/overview.md)** for full competition rules, background, scoring, and submission workflow. For evaluation details (sandbox, test generation, time and resource budgets) see **[rules/evaluation.md](rules/evaluation.md)**, and for related prior work see **[rules/literature.md](rules/literature.md)**.
 
@@ -93,7 +93,7 @@ Tier 0 covers the full operand range (10 sub-levels from 1-digit to 1233-digit) 
 
 ## Organizers
 
-Alberto Alferano, Francois Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger
+Alberto Alfarano, François Charton, Yongzheng Jia, Kristin Lauter, Cathy Li, Terence Tao, Emily Wenger
 
 ## Literature
 
