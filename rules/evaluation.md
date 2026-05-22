@@ -12,10 +12,26 @@ A submission is a **single HuggingFace repository** identified by `repo_id` + an
 
 | File | Purpose |
 |------|---------|
-| `manifest.json` | Declares the entry class (e.g. `{"entry_class": "model.MyModel"}`) and any other submission metadata. Validated against a Pydantic schema. |
+| `manifest.json` | Declares the entry class and the output base. Required fields: `entry_class` (dotted Python path, e.g. `"model.MyModel"`) and `output_base` (see below). Validated against a Pydantic schema. |
 | `model.py` | The model implementation. Must define the entry class declared in `manifest.json`. |
 | Weight files | The trained weights (`.pt`, `.pth`, `.safetensors`, `.bin`, `.gguf`, `.onnx`, etc.). |
 | Other files | Any additional code, configuration, or assets needed at inference time. |
+
+**`manifest.json` example:**
+
+```json
+{
+  "entry_class": "model.MyModel",
+  "output_base": 10,
+  "framework": "pytorch",
+  "model_description": "small decoder-only transformer, digit-level tokens"
+}
+```
+
+The `output_base` field tells the harness's decoder how to interpret the digits your model emits (see **Model Interface** below). Allowed values:
+
+- any integer in `[2, 2^32]` — model emits answers in that base
+- the string `"p"` — model emits answers in base equal to the current problem's prime (so the answer is always a single digit in `[0, p)`)
 
 | Limit | Reference value |
 |-------|-----------------|
@@ -26,21 +42,30 @@ The repository may be private during development and must be made **public** bef
 
 ## Model Interface
 
-The entry class must subclass `ModularMultiplicationModel` from `modchallenge.interface.base_model`:
+The entry class must subclass `ModularMultiplicationModel` from `modchallenge.interface.base_model`. The interface is split into three per-argument preprocessing hooks and a `predict_digits` method that emits the answer as base-`b` digits:
 
 ```python
 from modchallenge.interface.base_model import ModularMultiplicationModel
 
 class MyModel(ModularMultiplicationModel):
     def load(self, model_dir: str) -> None:
-        # Load weights, initialize the model. Called once before any predict call.
+        # Load weights, initialize the model. Called once before any
+        # preprocess / predict_digits call.
         ...
 
-    def predict(self, a: str, b: str, p: str) -> str:
-        # Return (a * b mod p) as a decimal string.
+    # Per-argument preprocessing. Each hook MAY ONLY ACCESS ITS OWN ARGUMENT.
+    # Defaults return the input unchanged; override to tokenise, embed, etc.
+    def preprocess_a(self, a: str): return a
+    def preprocess_b(self, b: str): return b
+    def preprocess_p(self, p: str): return p
+
+    def predict_digits(self, a_enc, b_enc, p_enc) -> list[int]:
+        # Run the model on the encoded inputs. Return the answer
+        # (a * b mod p) as a list of base-b digits, MOST-SIGNIFICANT-FIRST.
+        # b is the value declared in manifest.json's output_base field.
         ...
 
-    def predict_batch(self, inputs: list[tuple[str, str, str]]) -> list[str]:
+    def predict_digits_batch(self, inputs) -> list[list[int]]:
         # Optional. Override to enable GPU batching.
         ...
 
@@ -48,24 +73,35 @@ class MyModel(ModularMultiplicationModel):
         return 64
 ```
 
-Inputs are decimal strings of arbitrary length (`a >= 0`, `b >= 0`, `p >= 2` prime). The output must be a canonical decimal string equal to `(a * b) mod p` (full output specification in **Output Format** below).
+The pipeline runs, for each problem `(a, b, p)`:
 
-The decimal-string boundary is the **only** fixed contract. Inside `predict` (and `predict_batch`) you may use any internal representation — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings, etc. Encoding the inputs into your representation and decoding the model's output back to a decimal string both happen inside your code. See **Prohibited Practices** below for the boundary between *re-encoding* (allowed) and *computing the answer outside the model* (prohibited).
+```
+a_enc  = model.preprocess_a(a)        # operates on a only
+b_enc  = model.preprocess_b(b)        # operates on b only
+p_enc  = model.preprocess_p(p)        # operates on p only
+digits = model.predict_digits(a_enc, b_enc, p_enc)
+answer = pipeline_decoder(digits, base=manifest.output_base, prime=int(p))
+```
 
-Any architecture implementable within the supported sandbox runtime is allowed, subject to the restrictions in **Prohibited Practices** below.
+The pipeline-provided decoder reads `digits` as base-`b` digits (MSB-first) and produces the canonical integer answer. **Contestants do not implement the decoder** — that closes the post-processing attack surface.
+
+Per-argument preprocessing means no single point in your code has access to `a`, `b`, and `p` together. (The pipeline runs a sanity check that catches the obvious workarounds, like stashing previous-call inputs in instance state; see **Prohibited Practices** below.)
 
 ## Output Format
 
-The output of `predict()` (and each element of `predict_batch()`) must be a **canonical decimal string** representing `(a * b) mod p`:
+`predict_digits` (and each element of `predict_digits_batch`) must return a **list of `int`** representing the answer as base-`b` digits, where `b` is the value declared by `manifest.output_base` (or the current prime if `output_base == "p"`).
 
-- digits `0`-`9` only
-- no leading zeros, except for the literal string `"0"` representing zero
-- no whitespace, no signs, no separators, no scientific notation
-- type must be `str` (not `None`, not `bytes`, not `int`)
+Format requirements (enforced by the decoder):
 
-Outputs that violate the canonical format are scored as **incorrect** for that problem. They do not raise an error and do not abort the run.
+- type must be `list`; each entry must be a plain `int` (not `bool`, not `numpy.int64` — convert to `int` before returning)
+- digits are most-significant-first
+- each digit must be in `[0, base - 1]`
+- on scored tiers (Tier 1–10): the decoded integer must be in `[0, p)`. A value `>= p` is malformed.
+- on Tier 0 (pure multiplication, no modular reduction): the decoded value may exceed `p`.
 
-**Batch contract:** if `predict_batch(inputs)` returns a list whose length differs from `len(inputs)`, the entire tier is marked incomplete and scores **0%**. The pipeline does not attempt to re-align partial results.
+Outputs that violate any of the above are scored as **incorrect** for that problem. They do not raise an error and do not abort the run.
+
+**Batch contract:** if `predict_digits_batch(inputs)` returns a list whose length differs from `len(inputs)`, the entire tier is marked incomplete and scores **0%**. The pipeline does not attempt to re-align partial results.
 
 ## Submission Workflow
 
@@ -103,23 +139,29 @@ The submitted model runs in an isolated sandbox during evaluation:
 - **No secrets** — the HuggingFace token used to download the repository is not propagated to the model process; no other API keys or environment variables are exposed beyond a minimal allowlist (`PATH`, `HOME`, `LANG`, etc.).
 - **Restricted filesystem** — read access is limited to the submission directory and standard system paths required by the runtime; write access is limited to a scratch directory. Reading other locations on the host is blocked.
 - **No subprocess / no dynamic code execution** — the model may not spawn subprocesses, invoke `eval`/`exec`, or otherwise execute code outside the loaded module.
-- **Deterministic seeding** — the pipeline sets a fixed RNG seed before each batch; the model is expected to be deterministic.
+- **Determinism is the model's responsibility** — the pipeline does not seed your RNG; if your model uses any internal randomness, seed it inside `load()` or the preprocess / `predict_digits` methods. The pipeline runs an automated determinism check (see below) and excludes non-deterministic submissions from the ranked leaderboard.
 
 ```
-HuggingFace repo --(loader, manifest validation)--> Sandbox --(predict / predict_batch)--> Scorer
+HuggingFace repo --(loader, manifest validation)--> Sandbox --(preprocess_* / predict_digits_batch)--> Decoder --> Scorer
 ```
 
 The sandbox is a Docker container at official evaluation time. Local testing via `modchallenge evaluate-hf` currently runs **without** the sandbox (trusted-use only); contestants are expected to test against the sandbox before final submission once the Docker image is published. Sandbox image and configuration: **TBD**.
 
 ## Evaluation Pipeline
 
-The pipeline runs three steps for each submission:
+For each submission the pipeline runs the following stages in order:
 
-1. **Test generation** — generate the test set for this run from the master seed (see below).
-2. **Inference** — run the model over all problems, batched up to `max_batch_size()` where applicable.
-3. **Determinism check** — re-run a sampled subset of problems and compare outputs; nondeterministic submissions are flagged and excluded from the ranked leaderboard.
+1. **Manifest validation** — parse and schema-check `manifest.json` (`entry_class`, `output_base`, etc.).
+2. **Artifact-size check** — reject submissions whose total file size exceeds the artifact-size limit.
+3. **Static analysis** — AST-scan the submission's `.py` files for disallowed imports and the obvious modular-product shortcut patterns. Submissions with findings are rejected before the model is loaded.
+4. **Test generation** — generate the test set for this run from the master seed (see below).
+5. **Model load** — import the entry class and call `load(model_dir)` once.
+6. **Preprocess-isolation sanity check** — call each preprocess hook twice on the same input (with calls to the other hooks interleaved) and verify the outputs match. This flags the simplest forms of cross-argument leakage.
+7. **Determinism check** — run a sampled subset of problems through the full preprocess + `predict_digits_batch` + decode pipeline twice and compare. Non-deterministic submissions are flagged and excluded from the ranked leaderboard.
+8. **Inference** — run the model over all 1100 problems, per tier, batched up to `max_batch_size()` where applicable; decode each batch's emitted digits into canonical integers via the harness decoder.
+9. **Scoring** — compare decoded answers against ground truth; produce `overall_accuracy` and `highest_tier_above_90`.
 
-The pipeline is implemented in `src/modchallenge/evaluation/pipeline.py` and is shared between local testing and official evaluation. Official evaluation additionally executes the model inside the sandbox described in **Solver Environment**; local testing via `modchallenge evaluate-hf` currently runs the model in the host process (trusted-use only). Apart from the sandbox boundary and the package allowlist that comes with it, the test-generation, inference loop, scoring, and determinism check are the same code path in both settings.
+The pipeline is implemented in `src/modchallenge/evaluation/pipeline.py` and is shared between local testing and official evaluation. Official evaluation additionally executes the model inside the sandbox described in **Solver Environment**; local testing via `modchallenge evaluate-hf` currently runs the model in the host process (trusted-use only). Apart from the sandbox boundary and the package allowlist that comes with it, every stage above is the same code path in both settings.
 
 ## Test Generation
 
@@ -178,14 +220,14 @@ Submissions must be **deterministic**: the same `(a, b, p)` input must produce t
 
 The pipeline performs an automated determinism check on a sampled subset of problems by running them twice and comparing outputs. Submissions that fail the check are flagged and excluded from the ranked leaderboard.
 
-If a model uses any source of randomness internally (sampling, dropout at inference, MCMC, etc.), it is the contestant's responsibility to seed it deterministically inside `load()` or `predict()`.
+If a model uses any source of randomness internally (sampling, dropout at inference, MCMC, etc.), it is the contestant's responsibility to seed it deterministically inside `load()` or inside the preprocess / `predict_digits` methods.
 
 ## Time and Resource Budget
 
 | Resource | Reference value | Notes |
 |----------|-----------------|-------|
 | Total inference wall-clock | 5 minutes for 1100 problems | TBD; may be tuned. |
-| Per-problem soft target | ~273 ms | Use `predict_batch()` and GPU batching to amortize. |
+| Per-problem soft target | ~273 ms | Use `predict_digits_batch()` and GPU batching to amortize. |
 | `load()` budget | TBD | Bounded separately; not counted against the inference wall-clock. |
 | Determinism check | TBD | Bounded separately; not counted against the inference wall-clock. |
 | Total artifact size | 20 GB | Weights + code + all files. |
@@ -193,8 +235,9 @@ If a model uses any source of randomness internally (sampling, dropout at infere
 
 **Wall-clock measurement (mechanical policy):**
 
-- The inference timer **starts** when the pipeline issues the first `predict_batch` call after `load()` completes.
-- The timer **excludes** `load()` (separate bounded budget) and the determinism check (separate bounded budget on a small sample).
+- The inference timer **starts** at the entry to `run_inference`, immediately after `load()`, the static check, the preprocess-isolation check, and the determinism check have all completed.
+- The timer **covers** every per-problem call inside the inference loop: each `preprocess_a` / `preprocess_b` / `preprocess_p`, each `predict_digits_batch`, and the harness decoder.
+- The timer **excludes** `load()` (separate bounded budget), the determinism check (separate bounded budget on a small sample), and any organizer-side overhead.
 - Tiers run in order: Tier 0 first, then Tiers 1, 2, ..., 10.
 - **On timeout:**
   - The tier currently being processed scores **0%**; partial results within that tier are discarded.
@@ -205,49 +248,47 @@ If a model uses any source of randomness internally (sampling, dropout at infere
 
 The principle: **the model must learn to compute `(a * b) mod p`. It may not delegate, look up, or hard-code the computation.**
 
+Many obvious attack paths are eliminated structurally by the interface — there is no contestant-written post-processor, and each preprocess hook only sees its own argument, so no single point in your code can witness `a`, `b`, and `p` simultaneously. The rules below close the remaining gaps.
+
 The following are **not allowed at inference time**:
 
 - **Computing the final answer** `(a * b) mod p` using:
   - symbolic-math libraries: `sympy`, `gmpy2`, `mpmath`, `flint`, etc.
-  - Python's built-in arbitrary-precision integer arithmetic on the full operands (e.g. `str(int(a) * int(b) % int(p))`)
+  - Python's built-in arbitrary-precision integer arithmetic on the original `(a, b, p)` arguments (e.g. by stashing them in instance state across the three preprocess hooks and recombining inside `predict_digits`)
 - **Hard-coding** test answers, lookup tables indexed by the evaluation inputs, or fingerprints / hashes of the evaluation set into the model weights or code.
+- **Cross-argument leakage in preprocessing**: a `preprocess_a` call must not depend on a previously-seen `b` or `p` value (and similarly for the others). The pipeline runs a sanity check that catches the simplest forms of this.
 - Dynamic code execution: `eval`, `exec`, `compile`, `__import__` of arbitrary modules, `ctypes`, or any other mechanism used to load or execute computation outside the model.
 - Network access of any kind.
 - Reading files outside the submission directory (other than standard runtime libraries on `sys.path`).
 - Spawning subprocesses or invoking system commands.
 
-**Explicitly allowed: representation conversion.** Using `int()`, modular arithmetic on small intermediate quantities, base conversion, p-adic decomposition, CRT splitting, byte-level encoding, or any other standard transformation to **re-encode** inputs into your model's internal representation, or to **decode** the model's output back to a decimal string, is **not a violation**.
+**Explicitly allowed: per-argument representation work.** Inside a single preprocess hook you may use `int()`, base conversion, modular arithmetic on small intermediate quantities, p-adic decomposition, CRT splitting against fixed small moduli, byte-level encoding, or any other standard transformation that depends **only on that hook's argument**. The same applies inside the model's forward pass: any computation is fine as long as it is genuinely performed by the model (rather than by a hard-coded lookup keyed on the evaluation inputs).
 
-**Structural test for the boundary.** The issue is not how the code is spelled but where the answer comes from. If pre- or post-processing code combines information from `a`, `b`, **and** `p` to derive part of the final residue digits — whether by chunked / streaming multiplication, Karatsuba, CRT recombination of model outputs against `p`, or any other algorithm — it is treated as *computing the answer outside the model*, even if no expression of the form `int(a) * int(b) % int(p)` ever appears. The model's output must materially determine the answer digits; conversion code must be representational only, not computational.
+The principle is: **the model's emitted digit list must materially determine the answer.** If your `predict_digits` could return arbitrary garbage and the answer would still come out correct from some other code path, you are computing the answer outside the model.
 
 Borderline examples (allowed):
 
-- `int(a)` to parse the decimal string into a Python int as a step in computing its base-`q` digits — uses only `a`, no combination with `b` or `p`
-- `int(p) % q` to set up CRT moduli — uses only `p`, no combination with `a` or `b`
-- a base-`b` representation of `a` and `b` fed to the model, with the answer reconstructed digit-by-digit from the model's output — the model output materially determines the answer
-- the model emits the answer as CRT residues (or any other representation), and the post-processor deterministically decodes those residues into the canonical decimal string — decoding consumes only the model output (and `p` for canonicalization), not `a` or `b`
+- `int(a)` to parse the decimal string into a Python int as a step in computing its base-`q` digits inside `preprocess_a` — uses only `a`
+- `int(p) % q` for some fixed small `q` inside `preprocess_p` to set up CRT moduli — uses only `p`
+- The model emits the answer as base-256 digits, declared via `"output_base": 256` in the manifest; the harness decoder reconstructs the integer answer
 
 Borderline examples (prohibited):
 
-- Computing `int(a) * int(b) % int(p)` and then "encoding" it as the answer
-- A neural model whose forward pass returns garbage but whose output post-processor computes the answer from `int(a)`, `int(b)`, `int(p)` regardless of the model output
-- Splitting `a` and `b` into chunks, asking the model only for individual chunk products, and recombining them modulo `p` in the post-processor — the recombination is the modular multiplication, not the model
-- The post-processor computes CRT residues itself from `int(a)`, `int(b)` against small prime factors and uses those residues — residues come from the algorithm, not the model
-- Per-prime-factor CRT in the post-processor: model produces residues against small primes, post-processor recombines using `p` — recombination is the answer
-
-The principle is symmetric: **decoding model-produced residues / digits / encodings into the answer is fine; computing residues or the final modular product from `a`, `b`, `p` outside the model is not.**
+- Stashing `a` and `b` in `self._cache` during `preprocess_a` / `preprocess_b`, then computing `(int(self._cache['a']) * int(self._cache['b'])) % int(self._cache['p'])` inside `predict_digits` and emitting that as the answer
+- A neural model whose forward pass returns garbage but whose emitted digit list always decodes to the right answer because the digits were precomputed from `a`, `b`, `p` in preprocessing
+- A `predict_digits` implementation that ignores its inputs entirely and looks up an answer keyed by a hash of the original `(a, b, p)` it stashed earlier
 
 **Enforcement layers** (the design below is the target for the official evaluation; layers marked *planned* are under active development and will be published as the implementation matures, in time for the official evaluation runs):
 
 1. **Sandbox package allowlist** *(planned)*. The evaluation sandbox is a published Docker image whose package list will be fixed and disclosed as soon as the image is finalized, so contestants can build and test against it during the competition window. The runtime initially centers on PyTorch; broader runtime support (JAX, TensorFlow, ONNX, etc.) may be added based on contestant demand. The image will not include `sympy`, `gmpy2`, `mpmath`, `flint`, or networking / subprocess libraries; `import` of any package not in the image fails at load time. Any further restrictions on the Python stdlib (if needed) will be listed in the published image spec.
-2. **Static analysis** *(planned)*. Every submission's source is AST-scanned before evaluation. The scanner flags disallowed imports, calls to `eval` / `exec` / `compile` / `__import__` / `ctypes`, and obvious patterns of computing the modular product from `(a, b, p)` directly (e.g. `int(_) * int(_) % int(_)` and arithmetic equivalents). Submissions matching these patterns are rejected before the model is loaded. Static analysis is intentionally narrow — it catches the easy cases; subtler code paths (e.g. chunked multiplication, CRT recombination in post-processing) are caught by Layer 4.
+2. **Static analysis.** Every submission's source is AST-scanned before the model is loaded. The scanner flags disallowed imports, calls to `eval` / `exec` / `compile` / `__import__` / `ctypes`, and the obvious modular-product shortcut pattern `int(_) * int(_) % int(_)` (and arithmetic equivalents like `pow(int(_), int(_), int(_))`). Submissions with findings are rejected. Static analysis is intentionally narrow — it catches the easy literal patterns; subtler attempts (computation hidden inside `predict_digits` itself, or cross-argument leakage that the preprocess-isolation sanity check misses) are caught by Layer 4. Implementation: `src/modchallenge/security/static_check.py`.
 3. **Behavioral signals for review** *(planned)*. Submissions may be subject to investigative checks that produce **signals for organizer review**, not automatic disqualification:
    - **Weight perturbation**: random small perturbation of the model weights; if accuracy is essentially unchanged, the model may not be using its weights to produce the answer. *Caveat:* this can miss code-based solvers and may false-flag fragile or aggressively quantized models.
    - **Distribution shift**: re-evaluation on a separately seeded test set drawn from the same distribution; large divergence from the official score is a possible indicator of over-fitting to a leaked seed. *Caveat:* legitimate models can also show non-trivial variance.
    - **Latency profile**: per-problem inference time vs operand size; an essentially flat curve across tiers is a possible indicator of a constant-time shortcut. *Caveat:* aggressive batching can flatten the curve for legitimate models.
 
    These checks inform the manual review in Layer 4 — they do not by themselves disqualify a submission.
-4. **Manual code review.** Required for top leaderboard entries and any submission flagged by Layer 2 (static analysis) or Layer 3 (behavioral signals). The reviewer reads `model.py` and any auxiliary code, applying the **structural test** above to decide whether the submission is computing the answer in the model or outside it.
+4. **Manual code review.** Required for top leaderboard entries and any submission flagged by Layer 2 (static analysis) or Layer 3 (behavioral signals). The reviewer reads `model.py` and any auxiliary code, applying the principle above ("the model's emitted digit list must materially determine the answer") to decide whether the submission is computing the answer in the model or outside it.
 
 Any submission found to violate the rules is disqualified and removed from the leaderboard.
 

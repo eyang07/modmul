@@ -29,6 +29,9 @@ rules/reference/
 # Claude Code internal state
 .claude/
 
+# Overnight session handoff notes (local only)
+OVERNIGHT_NOTES.md
+
 # External dependencies (cloned separately)
 axolver/
 

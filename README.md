@@ -2,7 +2,7 @@
 
 Can a neural network learn modular multiplication?
 
-Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. Operands can be hundreds of digits long — far beyond what fits in a 64-bit integer. Your model must **learn** to compute the answer — it may not delegate the modular product to symbolic-math libraries or to Python's built-in arbitrary-precision arithmetic. (Using those for representation conversion is fine; see [rules/overview.md](rules/overview.md#prohibited-practices) for the precise boundary.)
+Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. Operands can be hundreds of digits long — far beyond what fits in a 64-bit integer. Your model must **learn** to compute the answer — it may not delegate the modular product to symbolic-math libraries, Python's built-in arbitrary-precision arithmetic, or any other algorithmic shortcut. Submissions implement a narrow interface (three per-argument preprocessing hooks plus `predict_digits` returning the answer as base-`b` digits); the harness-provided decoder does the rest. See [rules/overview.md](rules/overview.md#prohibited-practices) for the precise rules.
 
 See **[rules/overview.md](rules/overview.md)** for full competition rules, background, scoring, and submission workflow. For evaluation details (sandbox, test generation, time and resource budgets) see **[rules/evaluation.md](rules/evaluation.md)**, and for related prior work see **[rules/literature.md](rules/literature.md)**.
 
@@ -34,7 +34,8 @@ pytest
 src/modchallenge/
   interface/        Model ABC + manifest schema (what contestants implement)
   testgen/          Test case generation (CSPRNG, 11 difficulty tiers)
-  evaluation/       Pipeline, scorer, LLM wrapper, model loader
+  evaluation/       Pipeline, scorer, decoder, LLM wrapper, model loader
+  security/         AST-based static-analysis scanner (pre-load anti-cheat)
   leaderboard/      JSON-based ranking store
   cli.py            CLI entry point
 
@@ -78,8 +79,11 @@ Tier 0 covers the full operand range (10 sub-levels from 1-digit to 1233-digit) 
 |---------|-------------|
 | `modchallenge evaluate <dir>` | Evaluate a local submission directory |
 | `modchallenge evaluate-hf <repo> <hash>` | Evaluate a HuggingFace submission (trusted-use only, no sandbox) |
+| `modchallenge evaluate-sandboxed <dir>` | Evaluate a local submission inside the sandbox Docker image |
 | `modchallenge evaluate-example` | Run all models from examples/examples.json |
 | `modchallenge evaluate-llm <model_id>` | Quick-test any HF LLM (exploratory, not ranked) |
+| `modchallenge check <dir>` | Static-analyze a submission for prohibited code patterns |
+| `modchallenge build-sandbox` | Build the sandbox Docker image |
 | `modchallenge leaderboard` | Display the leaderboard |
 | `modchallenge generate-public <dir>` | Generate the public benchmark test set |
 

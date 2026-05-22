@@ -124,8 +124,11 @@ def evaluate_llm(
     wrapper = GenericLLMWrapper(model_id=model_id, revision=rev, dtype=dtype)
     wrapper.load("")
 
-    is_deterministic = check_determinism(wrapper, test_set)
-    predictions = run_inference(wrapper, test_set, timeout_seconds=config.timeout_seconds)
+    # LLM wrapper always emits base-10 digits; see llm_wrapper.predict_digits.
+    is_deterministic = check_determinism(wrapper, test_set, output_base=10)
+    predictions = run_inference(
+        wrapper, test_set, output_base=10, timeout_seconds=config.timeout_seconds,
+    )
 
     result = score_full_in_memory(test_set, predictions)
     result.deterministic = is_deterministic
@@ -207,8 +210,15 @@ def evaluate_example(
                 model_id=ex["repo_id"], revision=ex.get("revision"), dtype="bfloat16",
             )
             wrapper.load("")
-            is_deterministic = check_determinism(wrapper, shared_test_set)
-            predictions = run_inference(wrapper, shared_test_set, timeout_seconds=config.timeout_seconds)
+            # LLM wrapper always emits base-10 digits.
+            is_deterministic = check_determinism(
+                wrapper, shared_test_set, output_base=10,
+            )
+            predictions = run_inference(
+                wrapper, shared_test_set,
+                output_base=10,
+                timeout_seconds=config.timeout_seconds,
+            )
             result = score_full_in_memory(shared_test_set, predictions)
             result.deterministic = is_deterministic
             result.repo_id = ex["repo_id"]
@@ -264,6 +274,151 @@ def generate_public(
     test_set = generate_public_test_set(config)
     write_test_full(test_set, output_dir)
     typer.echo(f"Public benchmark written to {output_dir} ({test_set.total_cases} cases)")
+
+
+# ---------------------------------------------------------------------------
+# Sandboxed evaluation
+# ---------------------------------------------------------------------------
+
+DEFAULT_SANDBOX_IMAGE = "modchallenge-sandbox"
+
+
+@app.command()
+def evaluate_sandboxed(
+    submission_dir: Path = typer.Argument(..., help="Local submission directory"),
+    image: str = typer.Option(
+        DEFAULT_SANDBOX_IMAGE,
+        help="Docker image tag to run (build with `modchallenge build-sandbox`)",
+    ),
+    total: int = typer.Option(1100, help="Total number of test problems"),
+    seed: str = typer.Option("", help="Master seed hex string (empty = random)"),
+    timeout: int = typer.Option(300, help="Inference wall-clock budget (s)"),
+    memory: str = typer.Option("8g", help="Container memory limit"),
+    cpus: str = typer.Option("4", help="Container CPU limit"),
+    tmpfs_size: str = typer.Option("2g", help="Size of the /tmp tmpfs mount"),
+    skip_static_check: bool = typer.Option(
+        False, "--skip-static-check", help="Trusted-use bypass of the static check"
+    ),
+    output: Path = typer.Option(None, help="Write result JSON to this file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Evaluate a local submission inside the sandboxed Docker image.
+
+    The container runs with `--network none --read-only`, a writable tmpfs at
+    /tmp, and bind mounts the submission read-only. The evaluation result is
+    written to a temporary file inside an output volume and surfaced here.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    _setup_logging(verbose)
+
+    if shutil.which("docker") is None:
+        typer.echo("error: docker is not on PATH", err=True)
+        raise typer.Exit(code=2)
+
+    submission_dir = submission_dir.resolve()
+    if not submission_dir.is_dir():
+        typer.echo(f"error: {submission_dir} is not a directory", err=True)
+        raise typer.Exit(code=2)
+
+    with tempfile.TemporaryDirectory(prefix="modchallenge-sandbox-") as tmp:
+        host_output_dir = Path(tmp)
+        result_file_in_container = "/sandbox/output/result.json"
+
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--read-only",
+            "--tmpfs", f"/tmp:size={tmpfs_size},mode=1777",
+            "--memory", memory,
+            "--cpus", cpus,
+            "-v", f"{submission_dir}:/sandbox/submission:ro",
+            "-v", f"{host_output_dir}:/sandbox/output",
+            "-e", "MODCHALLENGE_SUBMISSION=/sandbox/submission",
+            "-e", f"MODCHALLENGE_OUTPUT={result_file_in_container}",
+            "-e", f"MODCHALLENGE_TOTAL={total}",
+            "-e", f"MODCHALLENGE_TIMEOUT={timeout}",
+        ]
+        if seed:
+            cmd += ["-e", f"MODCHALLENGE_SEED={seed}"]
+        if skip_static_check:
+            cmd += ["-e", "MODCHALLENGE_SKIP_STATIC=1"]
+        cmd.append(image)
+
+        if verbose:
+            typer.echo("docker cmd: " + " ".join(cmd), err=True)
+        proc = subprocess.run(cmd, capture_output=False)
+
+        result_path = host_output_dir / "result.json"
+        if result_path.exists():
+            payload = json.loads(result_path.read_text())
+            _output_result(payload, output)
+        else:
+            typer.echo(
+                "error: container produced no result.json (exit code "
+                f"{proc.returncode})", err=True,
+            )
+
+        if proc.returncode != 0:
+            raise typer.Exit(code=proc.returncode)
+
+
+@app.command()
+def build_sandbox(
+    image: str = typer.Option(DEFAULT_SANDBOX_IMAGE, help="Tag for the built image"),
+    repo_root: Path = typer.Option(
+        Path.cwd(), help="Repo root (build context for the Docker build)"
+    ),
+) -> None:
+    """Build the sandbox Docker image (`docker/Dockerfile`)."""
+    import shutil
+    import subprocess
+
+    if shutil.which("docker") is None:
+        typer.echo("error: docker is not on PATH", err=True)
+        raise typer.Exit(code=2)
+
+    dockerfile = repo_root / "docker" / "Dockerfile"
+    if not dockerfile.exists():
+        typer.echo(f"error: {dockerfile} not found", err=True)
+        raise typer.Exit(code=2)
+
+    cmd = ["docker", "build", "-f", str(dockerfile), "-t", image, str(repo_root)]
+    typer.echo("docker cmd: " + " ".join(cmd))
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        raise typer.Exit(code=proc.returncode)
+    typer.echo(f"built {image}")
+
+
+# ---------------------------------------------------------------------------
+# Static analysis
+# ---------------------------------------------------------------------------
+
+@app.command()
+def check(
+    submission_dir: Path = typer.Argument(..., help="Path to a submission directory"),
+) -> None:
+    """Static-analyze a submission for prohibited code patterns.
+
+    Exit code 0 if clean, 1 if any findings are reported. Findings are printed
+    one per line in `path:line:col [rule] message` format.
+    """
+    from modchallenge.security.static_check import check_submission
+
+    if not submission_dir.is_dir():
+        typer.echo(f"error: {submission_dir} is not a directory", err=True)
+        raise typer.Exit(code=2)
+
+    findings = check_submission(submission_dir)
+    for f in findings:
+        typer.echo(f.format())
+    if findings:
+        typer.echo(f"\n{len(findings)} finding(s)", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"clean ({submission_dir})")
 
 
 if __name__ == "__main__":

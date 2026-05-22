@@ -1,63 +1,107 @@
 """Unified model interface for the Modular Arithmetic Challenge.
 
-All submissions must implement ModularMultiplicationModel.
-The evaluator calls load() once, then predict_batch() repeatedly.
+All submissions implement ``ModularMultiplicationModel``.
+
+Pipeline contract (per problem ``(a, b, p)``)::
+
+    a_enc = model.preprocess_a(a)
+    b_enc = model.preprocess_b(b)
+    p_enc = model.preprocess_p(p)
+    digits = model.predict_digits(a_enc, b_enc, p_enc)
+    answer = pipeline_decoder(digits, base=manifest.output_base, prime=int(p))
+
+The decoder is implemented by the harness, not by the submission. Contestants
+declare the base they want their model to emit answers in via the
+``output_base`` field in ``manifest.json``. The decoder reads the returned
+digits MSB-first and reconstructs the integer answer.
+
+Each ``preprocess_*`` function may only access its own argument. Crossing
+arguments (e.g. reading ``b`` inside ``preprocess_a``) defeats the structural
+anti-cheat design and is checked by the pipeline.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 class ModularMultiplicationModel(ABC):
     """Abstract base class that all submissions must implement.
 
-    The predict() boundary takes decimal strings (a, b, p) and returns
-    a decimal string. The internal representation used inside the model
-    -- digit-level tokens, p-adic, CRT decomposition, other bases, custom
-    embeddings, etc. -- is entirely up to the contestant.
+    The model may use any architecture and any internal representation,
+    subject to the rules in ``rules/evaluation.md``. The only fixed contract
+    is the interface below.
     """
+
+    # -- lifecycle ------------------------------------------------------
 
     @abstractmethod
     def load(self, model_dir: str) -> None:
-        """Load model weights and any config from model_dir.
+        """Load model weights and config from ``model_dir``.
 
-        model_dir is the local path of the downloaded HuggingFace repo.
-        Called exactly once before any predict calls.
+        Called exactly once before any ``preprocess_*`` or ``predict_digits``
+        call. Time spent here is bounded separately from the inference budget.
         """
 
-    def predict(self, a: str, b: str, p: str) -> str:
-        """Compute a*b mod p.
+    # -- per-argument preprocessing (optional; defaults are identity) ---
 
-        Args:
-            a: First operand as a decimal string, a >= 0. Can be much larger than p.
-            b: Second operand as a decimal string, b >= 0. Can be much larger than p.
-            p: Prime modulus as a decimal string, p >= 2.
+    def preprocess_a(self, a: str) -> Any:
+        """Convert the decimal string ``a`` into the model's input representation.
 
-        Returns:
-            The result (a*b mod p) as a canonical decimal string.
-            Must contain only digits 0-9, no leading zeros (except "0" itself),
-            no spaces, newlines, signs, or separators.
+        The default returns ``a`` unchanged. Override to perform tokenisation,
+        base conversion, embedding lookup, etc.
+
+        **Must depend only on ``a``.** Reading the value of ``b`` or ``p``
+        from instance state populated by a previous call is a rule violation
+        and the pipeline runs a sanity check for the simplest forms of this.
         """
-        raise NotImplementedError
+        return a
 
-    def predict_batch(self, inputs: list[tuple[str, str, str]]) -> list[str]:
-        """Batch prediction. Override to leverage GPU batching.
+    def preprocess_b(self, b: str) -> Any:
+        """Convert the decimal string ``b``. Per-argument; see ``preprocess_a``."""
+        return b
 
-        Default implementation calls predict() one by one.
+    def preprocess_p(self, p: str) -> Any:
+        """Convert the decimal string ``p``. Per-argument; see ``preprocess_a``."""
+        return p
 
-        Args:
-            inputs: List of (a, b, p) tuples, each as decimal strings.
+    # -- inference ------------------------------------------------------
 
-        Returns:
-            List of results in the same order as inputs.
+    @abstractmethod
+    def predict_digits(self, a_enc: Any, b_enc: Any, p_enc: Any) -> list[int]:
+        """Return the answer ``(a * b) mod p`` as a list of base-b digits.
+
+        Digits are **most-significant-first**; each must be ``int`` in
+        ``[0, base - 1]`` where ``base`` is the value declared in the
+        manifest's ``output_base`` field (or the current prime ``p`` if the
+        manifest declares ``output_base = "p"``).
+
+        For Tier 0 (pure multiplication, no modular reduction) the decoded
+        value may exceed ``p``. On scored tiers, decoded ``value >= p`` is
+        treated as malformed.
+
+        Malformed outputs (wrong type, out-of-range digit, oversize value on
+        a scored tier) score 0 for that problem; they do not abort the run.
         """
-        return [self.predict(a, b, p) for a, b, p in inputs]
+
+    def predict_digits_batch(
+        self, inputs: list[tuple[Any, Any, Any]]
+    ) -> list[list[int]]:
+        """Batched form of :meth:`predict_digits`.
+
+        Default implementation calls :meth:`predict_digits` one item at a
+        time. Override for GPU batching.
+
+        Returning a list whose length differs from ``len(inputs)`` is a
+        batch-contract failure and marks the entire tier as incomplete
+        (score 0%).
+        """
+        return [self.predict_digits(a, b, p) for a, b, p in inputs]
 
     def max_batch_size(self) -> int:
-        """Hint to the evaluator on the maximum comfortable batch size.
+        """Maximum comfortable batch size. The pipeline will not exceed this.
 
-        The evaluator will not send batches larger than this.
         Default is 1 (sequential). Override for GPU-batched models.
         """
         return 1

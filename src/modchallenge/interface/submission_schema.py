@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import re
+from typing import Union
 
 from pydantic import BaseModel, field_validator
+
+# Largest base contestants can declare. Bounded so the decoder can validate
+# digit ranges without unbounded resource usage.
+MAX_OUTPUT_BASE = 2**32
+
+# Sentinel string meaning "use the current problem's prime as the base".
+OUTPUT_BASE_PRIME_SENTINEL = "p"
 
 
 class SubmissionManifest(BaseModel):
     """Schema for the manifest.json file in a contestant's HF repo."""
 
     entry_class: str
+    output_base: Union[int, str]
     framework: str = "pytorch"
     model_description: str = ""
 
@@ -23,6 +32,34 @@ class SubmissionManifest(BaseModel):
                 f"entry_class must be a dotted Python path (e.g. 'model.MyModel'), got: {v!r}"
             )
         return v
+
+    @field_validator("output_base")
+    @classmethod
+    def validate_output_base(cls, v: object) -> Union[int, str]:
+        """Either an integer in [2, 2^32], or the string 'p' (use current prime)."""
+        if isinstance(v, bool):
+            # `bool` is a subclass of `int` in Python; reject explicitly.
+            raise ValueError(
+                f"output_base must be int in [2, {MAX_OUTPUT_BASE}] or string "
+                f"{OUTPUT_BASE_PRIME_SENTINEL!r}; got bool {v!r}"
+            )
+        if isinstance(v, str):
+            if v == OUTPUT_BASE_PRIME_SENTINEL:
+                return v
+            raise ValueError(
+                f"output_base string must be {OUTPUT_BASE_PRIME_SENTINEL!r} "
+                f"(meaning 'use the current prime as the base'); got {v!r}"
+            )
+        if isinstance(v, int):
+            if not (2 <= v <= MAX_OUTPUT_BASE):
+                raise ValueError(
+                    f"output_base int must be in [2, {MAX_OUTPUT_BASE}]; got {v}"
+                )
+            return v
+        raise ValueError(
+            f"output_base must be int in [2, {MAX_OUTPUT_BASE}] or string "
+            f"{OUTPUT_BASE_PRIME_SENTINEL!r}; got type {type(v).__name__}"
+        )
 
 
 class SubmissionRef(BaseModel):

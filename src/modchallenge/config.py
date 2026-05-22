@@ -65,6 +65,7 @@ class EvalConfig:
     edge_cases_per_tier: int = 4  # a=0, b=0, a=1, b=1
     timeout_seconds: int = 300  # 5 minutes total
     max_artifact_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GB
+    skip_static_check: bool = False  # set True for trusted-use during development
 
     def __post_init__(self) -> None:
         if self.total_problems % NUM_TIERS != 0:

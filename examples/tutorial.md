@@ -38,35 +38,58 @@ If the private examples run, your setup is correct and your own submissions will
 
 ### 1. Implement the Interface
 
+The interface is intentionally narrow: three per-argument preprocessing hooks (each only ever sees its own argument) and one `predict_digits` method that emits the answer as a list of base-`b` digits. The harness — not your code — decodes those digits into the final answer.
+
 ```python
 # model.py
 from modchallenge.interface.base_model import ModularMultiplicationModel
+
 
 class MyModel(ModularMultiplicationModel):
     def load(self, model_dir: str) -> None:
         # Load your trained weights
         ...
 
-    def predict(self, a: str, b: str, p: str) -> str:
-        # Compute (a * b) mod p
-        # a, b can be much larger than p — all are decimal strings
-        return result_string
+    # Per-argument preprocessing. Each hook only sees its own argument.
+    # Defaults are identity (pass the string through unchanged); override
+    # to tokenise, embed, do base conversion, etc.
+    def preprocess_a(self, a: str):
+        return [int(c) for c in a]   # e.g. digit-level tokens
 
-    def predict_batch(self, inputs: list[tuple[str, str, str]]) -> list[str]:
-        # Optional: override for GPU batching (default calls predict() in a loop)
+    def preprocess_b(self, b: str):
+        return [int(c) for c in b]
+
+    def preprocess_p(self, p: str):
+        return [int(c) for c in p]
+
+    def predict_digits(self, a_enc, b_enc, p_enc) -> list[int]:
+        # Run the model on the encoded inputs. Return the answer
+        # (a * b mod p) as base-b digits, MOST-SIGNIFICANT-FIRST.
+        # b = the value declared in manifest.json's output_base field.
+        # For example, with output_base = 10 and answer = 52, return [5, 2].
+        ...
+
+    def predict_digits_batch(self, inputs) -> list[list[int]]:
+        # Optional: override for GPU batching (default loops over predict_digits).
         ...
 
     def max_batch_size(self) -> int:
         return 64
 ```
 
-Create a `manifest.json`:
+Create a `manifest.json` declaring your entry class and the base you emit answers in:
 
 ```json
 {
-  "entry_class": "model.MyModel"
+  "entry_class": "model.MyModel",
+  "output_base": 10
 }
 ```
+
+Allowed `output_base` values:
+
+- any integer in `[2, 2^32]` — for example `2` (binary), `10` (decimal digits), `256` (bytes), `65536` (word-level), etc.
+- the string `"p"` — answers are emitted in base equal to the current prime, so each answer is a single digit in `[0, p)`
 
 Your submission directory:
 
@@ -151,5 +174,6 @@ Before the deadline:
 - Start with `--total 110` (10 per tier) for fast iteration, use `--total 1100` for thorough testing
 - Use `--seed <hex>` to get reproducible results across runs
 - Check Tier 0 results to diagnose whether failures come from multiplication or modular reduction
-- The `predict()` method receives decimal strings — handle arbitrarily large numbers
-- If your model uses GPU batching, override `predict_batch()` and `max_batch_size()`
+- The preprocessing hooks each see decimal strings — `a` and `b` can be hundreds of digits long (much larger than `p`); `p` is up to ~617 digits
+- If your model uses GPU batching, override `predict_digits_batch()` and `max_batch_size()`
+- The pipeline runs a sanity check that catches obviously stateful preprocessing (e.g. caching `a` in instance state so a later hook can read it) — design your preprocessing as pure per-argument functions

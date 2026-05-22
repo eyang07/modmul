@@ -57,7 +57,7 @@ a = "123456789", b = "987654321", p = "97"
 answer = "52"   # because (123456789 * 987654321) % 97 == 52
 ```
 
-This is a pure mathematical reasoning challenge. The decimal-string input/output is the official contract. **Internally your model may use any representation** — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings — as long as the function from decimal `(a, b, p)` to decimal answer is performed by your model, not delegated to an external library. See **Prohibited Practices** below for the precise boundary.
+This is a pure mathematical reasoning challenge. The official contract is fixed: your model receives the three decimal strings `(a, b, p)` (after a per-argument preprocessing pass you control) and emits the answer as a list of base-`b` digits. The harness decodes those digits into the canonical integer answer. **Internally your model may use any representation** — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings — as long as the answer is genuinely produced by your model's forward pass, not by a hard-coded shortcut. See **Prohibited Practices** below for the precise boundary.
 
 For the breakdown of difficulty tiers, the test-generation procedure, and the scoring rules used by the official evaluation, see [evaluation.md](evaluation.md).
 
@@ -70,12 +70,14 @@ For the breakdown of difficulty tiers, the test-generation procedure, and the sc
 
 ## Model Requirements
 
-- Submissions must implement the `ModularMultiplicationModel` Python interface. The `predict()` boundary takes the canonical decimal strings `(a, b, p)` and returns the canonical decimal answer; encoding and decoding inside the model is your choice.
+- Submissions must implement the `ModularMultiplicationModel` Python interface. The interface is split into three per-argument preprocessing hooks (`preprocess_a`, `preprocess_b`, `preprocess_p`) and a single `predict_digits` method that returns the answer as a list of base-`b` digits, MSB-first.
+- The model declares the base `b` it uses in `manifest.json` via the `output_base` field. Allowed values: any integer in `[2, 2^32]`, or the string `"p"` (meaning "use the current prime as the base").
+- The pipeline-provided decoder — not the contestant's code — converts the model's emitted digit list into the canonical integer answer and compares it against the ground truth. Contestants do not write post-processing code.
 - Submissions must be deterministic.
 - Any architecture **implementable within the supported sandbox runtime** is allowed: Transformer, RNN, CNN, hybrid, or novel approaches. The runtime contract (initially centered on PyTorch; broader runtime support such as JAX, TensorFlow, ONNX may be added based on contestant demand) is documented in [evaluation.md](evaluation.md).
-- Any internal representation of inputs and outputs is allowed: digit-level tokens, p-adic, CRT decomposition, other bases, learned embeddings, etc.
+- Any internal representation is allowed: digit-level tokens, p-adic, CRT decomposition, other bases, learned embeddings, etc. The pipeline contract only fixes the I/O shape; what happens inside the model is up to you.
 
-The interface signature, required file layout, artifact size limit, output format, and inference time budget are specified in [evaluation.md](evaluation.md).
+The full interface signature, required file layout, artifact size limit, output format, and inference time budget are specified in [evaluation.md](evaluation.md).
 
 ## Submission Workflow
 
@@ -98,20 +100,21 @@ For local testing during development (including the option of using a private HF
 
 ## Prohibited Practices
 
-The prohibitions below all share one principle: **the model must learn to compute `(a * b) mod p`; it may not delegate, look up, or hard-code the computation.**
+The principle: **the model must learn to compute `(a * b) mod p`; it may not delegate, look up, or hard-code the computation.**
+
+The interface is designed so that the most obvious attack paths are structurally impossible: the pipeline-provided decoder is the only code that converts the model's emitted digits into the answer, and the three preprocessing hooks each see only their own argument, so no single point in the contestant's code has simultaneous access to `a`, `b`, and `p`. The rules below close the remaining gaps.
 
 The following are **not allowed at inference time**:
 
-- **Computing the final answer** `(a * b) mod p` using symbolic-math libraries (`sympy`, `gmpy2`, `mpmath`, `flint`, etc.) or Python's built-in arbitrary-precision integer arithmetic (e.g. `int(a) * int(b) % int(p)`)
-- **Hard-coded answers** or lookup tables indexed by the evaluation inputs (or by hashes/fingerprints of them)
-- Dynamic code execution: `eval`, `exec`, `compile`, `__import__`, `ctypes`
-- Network access of any kind
-- Reading files outside the submission directory
-- Subprocess calls or system commands
+- **Computing the final answer** `(a * b) mod p` using symbolic-math libraries (`sympy`, `gmpy2`, `mpmath`, `flint`, etc.) or Python's built-in arbitrary-precision integer arithmetic on the original `(a, b, p)` arguments (e.g. by stashing them in instance state across preprocessing hooks and recombining inside `predict_digits`).
+- **Hard-coded answers** or lookup tables indexed by the evaluation inputs (or by hashes / fingerprints of them).
+- Dynamic code execution: `eval`, `exec`, `compile`, `__import__`, `ctypes`.
+- Network access of any kind.
+- Reading files outside the submission directory.
+- Subprocess calls or system commands.
+- Cross-argument leakage in preprocessing: a `preprocess_a` call must not depend on previously seen `b` or `p` values (and similarly for the others). The pipeline runs a sanity check that flags the simplest forms of this.
 
-**What is explicitly allowed:** using `int()`, base conversion, modular arithmetic on small intermediate values, or other standard operations to **convert representations** (decimal ↔ p-adic, decimal ↔ CRT components, decimal ↔ other bases, etc.) is fine. Pre-/post-processing, tokenization, and decoding all fall on the allowed side.
-
-**Structural test for the boundary.** The issue is not how the code is spelled but where the answer comes from. If pre- or post-processing code combines information from `a`, `b`, **and** `p` to derive part of the final residue digits — whether by chunked / streaming multiplication, Karatsuba, CRT recombination of model outputs against `p`, or any other algorithm — it is treated as *computing the answer outside the model*, even if no expression of the form `int(a) * int(b) % int(p)` ever appears. The model's output must materially determine the answer digits; conversion code must be representational only, not computational.
+**What is explicitly allowed:** using `int()`, base conversion, modular arithmetic on small intermediate values, or any other standard operation **inside a single per-argument preprocessing hook** (operating only on its own argument) or **inside the model itself** (provided the answer is genuinely produced by the model's forward pass, not by a hard-coded shortcut).
 
 Submissions found to violate these rules will be disqualified. Sandbox configuration, static-analysis checks, and the planned behavioral signals (weight perturbation, distribution shift, latency profile) are documented in [evaluation.md](evaluation.md).
 

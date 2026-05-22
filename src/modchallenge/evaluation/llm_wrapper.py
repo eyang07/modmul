@@ -1,16 +1,22 @@
 """Generic LLM wrapper for quick-testing any HuggingFace causal LM.
 
-This is a convenience tool for exploratory benchmarking only.
-Results from this wrapper are NOT eligible for official ranking
-because the fixed prompt and output parser are chosen by the organizers,
-not the contestant. For official submissions, contestants must implement
-ModularMultiplicationModel with their own wrapper.
+This is a convenience tool for exploratory benchmarking only. Results from
+this wrapper are NOT eligible for official ranking because the fixed prompt
+and output parser are chosen by the organizers, not the contestant. For
+official submissions, contestants must implement
+``ModularMultiplicationModel`` directly.
+
+The wrapper emits answers as base-10 digits (one digit per list entry,
+MSB-first), since that is the natural format for LLMs that output decimal
+text. The pipeline decoder is invoked exactly the same way as for any other
+submission.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -23,6 +29,10 @@ DEFAULT_PROMPT = (
     "Compute {a} * {b} mod {p}. "
     "Only output the final numerical result, nothing else."
 )
+
+# This wrapper always emits base-10 digits; the manifest synthesised for
+# `modchallenge evaluate-llm` should declare ``output_base = 10`` to match.
+WRAPPER_OUTPUT_BASE = 10
 
 
 class GenericLLMWrapper(ModularMultiplicationModel):
@@ -72,7 +82,6 @@ class GenericLLMWrapper(ModularMultiplicationModel):
         )
         self.model.eval()
 
-        # Check if tokenizer has a chat template
         self._has_chat_template = (
             hasattr(self.tokenizer, "chat_template")
             and self.tokenizer.chat_template is not None
@@ -81,6 +90,10 @@ class GenericLLMWrapper(ModularMultiplicationModel):
             "Model loaded. chat_template=%s, vocab_size=%d",
             self._has_chat_template, len(self.tokenizer),
         )
+
+    # The LLM wrapper consumes raw decimal strings directly; the default
+    # identity preprocess hooks suit it. (predict_a, predict_b, predict_p
+    # all return their input unchanged.)
 
     def _build_input(self, a: str, b: str, p: str) -> str:
         """Build the model input text for a single problem."""
@@ -93,7 +106,8 @@ class GenericLLMWrapper(ModularMultiplicationModel):
             )
         return prompt
 
-    def predict(self, a: str, b: str, p: str) -> str:
+    def _generate_decimal(self, a: str, b: str, p: str) -> str:
+        """Generate the LLM response and extract the last decimal number."""
         input_text = self._build_input(a, b, p)
         inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
 
@@ -109,14 +123,30 @@ class GenericLLMWrapper(ModularMultiplicationModel):
         new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
         response = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-        # Extract the last number from the response
+        # Extract the last number from the response.
         matches = re.findall(r"\d+", response)
         if matches:
             return matches[-1]
         return ""
 
-    def predict_batch(self, inputs: list[tuple[str, str, str]]) -> list[str]:
-        return [self.predict(a, b, p) for a, b, p in inputs]
+    def predict_digits(self, a_enc: Any, b_enc: Any, p_enc: Any) -> list[int]:
+        """Generate the LLM answer and return it as base-10 digits, MSB-first.
+
+        Empty / unparseable responses return ``[]``, which the pipeline
+        treats as ``0`` after decoding (scored as wrong unless the true
+        answer is 0).
+        """
+        decimal = self._generate_decimal(a_enc, b_enc, p_enc)
+        if not decimal:
+            return []
+        # Strip leading zeros so the canonical decoded value is correct.
+        stripped = decimal.lstrip("0") or "0"
+        return [int(c) for c in stripped]
+
+    def predict_digits_batch(
+        self, inputs: list[tuple[Any, Any, Any]]
+    ) -> list[list[int]]:
+        return [self.predict_digits(a, b, p) for a, b, p in inputs]
 
     def max_batch_size(self) -> int:
         return 1
