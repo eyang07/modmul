@@ -42,14 +42,14 @@ The results, techniques, and insights from all participants will be compiled and
 
 ## The Task
 
-Your model receives three decimal strings `a`, `b`, `p` and must return `(a * b) mod p` as a decimal string.
+Your model receives three decimal strings `a`, `b`, `p` and must compute `(a * b) mod p`.
 
 **Input:**
 - `a >= 0`, `b >= 0` (can be up to ~1233 decimal digits)
 - `p >= 2` is prime (up to ~617 decimal digits)
 - `a` and `b` can be much larger than `p`
 
-**Output:** A decimal string equal to `(a * b) mod p`
+**Output:** the integer `(a * b) mod p`. Your model emits it as a list of base-`b` digits through the interface (see **Model Requirements**); the harness converts those digits into the canonical answer. There is no contestant-side decoding step.
 
 **Example:**
 ```
@@ -57,7 +57,7 @@ a = "123456789", b = "987654321", p = "97"
 answer = "52"   # because (123456789 * 987654321) % 97 == 52
 ```
 
-This is a pure mathematical reasoning challenge. The official contract is fixed: your model receives the three decimal strings `(a, b, p)` (after a per-argument preprocessing pass you control) and emits the answer as a list of base-`b` digits. The harness decodes those digits into the canonical integer answer. **Internally your model may use any representation** — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings — as long as the answer is genuinely produced by your model's forward pass, not by a hard-coded shortcut. See **Prohibited Practices** below for the precise boundary.
+This is a pure mathematical reasoning challenge. The official contract is fixed: your model receives the three decimal strings `(a, b, p)` (after a per-argument preprocessing pass you control) and emits the answer as a list of base-`b` digits. The harness decodes those digits into the canonical integer answer — there is no contestant-side decoding step. **Internally your model may use any representation** — digit-level tokens, p-adic, CRT decomposition, other bases, custom embeddings — as long as the answer is genuinely produced by your model's *trained parameters*, not by an arithmetic algorithm hand-coded into the model or any other shortcut. See **Prohibited Practices** below for the precise boundary.
 
 For the breakdown of difficulty tiers, the test-generation procedure, and the scoring rules used by the official evaluation, see [evaluation.md](evaluation.md).
 
@@ -74,8 +74,8 @@ For the breakdown of difficulty tiers, the test-generation procedure, and the sc
 - The model declares the base `b` it uses in `manifest.json` via the `output_base` field. Allowed values: any integer in `[2, 2^32]`, or the string `"p"` (meaning "use the current prime as the base").
 - The pipeline-provided decoder — not the contestant's code — converts the model's emitted digit list into the canonical integer answer and compares it against the ground truth. Contestants do not write post-processing code.
 - Submissions must be deterministic.
-- Any architecture **implementable within the supported sandbox runtime** is allowed: Transformer, RNN, CNN, hybrid, or novel approaches. The runtime contract (initially centered on PyTorch; broader runtime support such as JAX, TensorFlow, ONNX may be added based on contestant demand) is documented in [evaluation.md](evaluation.md).
-- Any internal representation is allowed: digit-level tokens, p-adic, CRT decomposition, other bases, learned embeddings, etc. The pipeline contract only fixes the I/O shape; what happens inside the model is up to you.
+- Any architecture **implementable within the supported sandbox runtime** is allowed: Transformer, RNN, CNN, hybrid, or novel approaches. There is no architecture whitelist and Turing-complete / recurrent models are not prohibited as such; what matters is that the answer is produced by *trained parameters*, not by an arithmetic procedure hand-coded into the model (see **Prohibited Practices** and the model/circuit boundary in [evaluation.md](evaluation.md)). The runtime contract (initially centered on PyTorch; broader runtime support such as JAX, TensorFlow, ONNX may be added based on contestant demand) is documented in [evaluation.md](evaluation.md).
+- Any internal representation is allowed: digit-level tokens, p-adic, CRT decomposition, other bases, learned embeddings, etc. The pipeline contract only fixes the I/O shape; the internal computation is up to you, subject to the one boundary that the answer must come from trained parameters rather than a hand-coded arithmetic algorithm (see **Prohibited Practices**).
 
 The full interface signature, required file layout, artifact size limit, output format, and inference time budget are specified in [evaluation.md](evaluation.md).
 
@@ -114,7 +114,7 @@ The following are **not allowed at inference time**:
 - Subprocess calls or system commands.
 - Cross-argument leakage in preprocessing: a `preprocess_a` call must not depend on previously seen `b` or `p` values (and similarly for the others). The pipeline runs a sanity check that flags the simplest forms of this.
 
-**What is explicitly allowed:** using `int()`, base conversion, modular arithmetic on small intermediate values, or any other standard operation **inside a single per-argument preprocessing hook** (operating only on its own argument) or **inside the model itself** (provided the answer is genuinely produced by the model's forward pass, not by a hard-coded shortcut).
+**What is explicitly allowed:** using `int()`, base conversion, modular arithmetic on small intermediate values, or any other standard operation **inside a single per-argument preprocessing hook** (operating only on its own argument) or **inside the model itself** (provided the answer is produced by the model's trained parameters, not by a hard-coded shortcut or a by-construction arithmetic algorithm; see the two principles and the model/circuit boundary in [evaluation.md](evaluation.md)).
 
 Submissions found to violate these rules will be disqualified. Sandbox configuration, static-analysis checks, and the planned behavioral signals (weight perturbation, distribution shift, latency profile) are documented in [evaluation.md](evaluation.md).
 

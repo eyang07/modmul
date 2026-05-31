@@ -48,3 +48,6 @@ leaderboard.json
 *.safetensors
 *.gguf
 *.onnx
+
+# Local example exploration (not for distribution until approved)
+examples/exploration/

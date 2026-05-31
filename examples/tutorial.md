@@ -82,7 +82,8 @@ Create a `manifest.json` declaring your entry class and the base you emit answer
 ```json
 {
   "entry_class": "model.MyModel",
-  "output_base": 10
+  "output_base": 10,
+  "training_description": "trained from random init on 1M synthetic (a, b, p, a*b mod p) examples; digit-level tokenisation; AdamW, ~10k steps"
 }
 ```
 
@@ -99,6 +100,12 @@ my-model/
 ├── model.py
 └── weights.pt (or any model files)
 ```
+
+### The one rule that matters
+
+Your model must **learn** to compute `(a * b) mod p` — the answer must come from trained parameters. You may use any architecture and any internal representation, but you may **not** hand-code the arithmetic (schoolbook long multiplication, long division, Montgomery/Barrett reduction, CRT recombination) over the input values — **whether in Python integers or in tensor operations**. Such code returns the right answer regardless of the weights, which makes it a computational circuit, not a learned model. There is also no contestant-side decoding step: your only output is the base-`b` digit list, and the harness converts it to the answer.
+
+The full boundary, the two governing principles, and the enforcement (static analysis, weight-perturbation signal, manual review) are in [rules/evaluation.md](../rules/evaluation.md#prohibited-practices). Every `manifest.json` must include a non-empty `training_description` describing how your weights were obtained (training or fine-tuning procedure, data, starting point) — it is a **required** field and is what reviewers look at first.
 
 ### 2. Test Locally
 

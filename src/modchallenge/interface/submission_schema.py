@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Union
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 # Largest base contestants can declare. Bounded so the decoder can validate
 # digit ranges without unbounded resource usage.
@@ -22,6 +22,11 @@ class SubmissionManifest(BaseModel):
     output_base: Union[int, str]
     framework: str = "pytorch"
     model_description: str = ""
+    # Required, free-text. How the weights were obtained (training / fine-tuning
+    # procedure, data, starting point). Must be non-empty; content quality is
+    # judged by manual review, not mechanically. Submissions with no trained
+    # parameters at all should say so explicitly — see Prohibited Practices.
+    training_description: str = Field(min_length=1)
 
     @field_validator("entry_class")
     @classmethod

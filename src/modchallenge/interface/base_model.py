@@ -31,7 +31,11 @@ class ModularMultiplicationModel(ABC):
 
     The model may use any architecture and any internal representation,
     subject to the rules in ``rules/evaluation.md``. The only fixed contract
-    is the interface below.
+    is the interface below. The one substantive constraint on what happens
+    inside the model: the answer must be produced by *trained parameters*,
+    not by an arithmetic algorithm hand-coded into the forward pass (see
+    Prohibited Practices in ``rules/evaluation.md`` — that is a computational
+    circuit, not a learned model).
     """
 
     # -- lifecycle ------------------------------------------------------

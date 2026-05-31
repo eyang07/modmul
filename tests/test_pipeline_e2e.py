@@ -25,6 +25,7 @@ def _create_dummy_submission(tmpdir: Path, cheat: bool = False) -> Path:
         "framework": "none",
         "model_description": "dummy model for testing",
         "output_base": 10,
+        "training_description": "test fixture; no real training",
     }
     (model_dir / "manifest.json").write_text(json.dumps(manifest))
 
