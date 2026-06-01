@@ -21,7 +21,11 @@ class SubmissionManifest(BaseModel):
     entry_class: str
     output_base: Union[int, str]
     framework: str = "pytorch"
-    model_description: str = ""
+    # Required, free-text. What the model is: architecture (Transformer / RNN /
+    # CNN / hybrid / novel), approximate parameter count, input and output
+    # representations, and any key design choices a reviewer would need to
+    # understand the submission at a glance. Must be non-empty.
+    model_description: str = Field(min_length=1)
     # Required, free-text. How the weights were obtained (training / fine-tuning
     # procedure, data, starting point). Must be non-empty; content quality is
     # judged by manual review, not mechanically. Submissions with no trained

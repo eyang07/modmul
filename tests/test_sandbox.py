@@ -37,6 +37,7 @@ def _make_dummy_submission(tmp: Path, *, cheat: bool = False) -> Path:
             "entry_class": "model.DummyModel",
             "framework": "none",
             "output_base": 10,
+            "model_description": "test fixture; trivial dummy model",
             "training_description": "test fixture; no real training",
         })
     )

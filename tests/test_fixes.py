@@ -91,6 +91,7 @@ def test_module_isolation():
         (dir_a / "manifest.json").write_text(json.dumps({
             "entry_class": "model_a.ModelA",
             "output_base": 10,
+            "model_description": "test fixture",
             "training_description": "test fixture",
         }))
         (dir_a / "helper.py").write_text('def get_digits(): return [1, 2, 3]\n')
@@ -107,6 +108,7 @@ def test_module_isolation():
         (dir_b / "manifest.json").write_text(json.dumps({
             "entry_class": "model_b.ModelB",
             "output_base": 10,
+            "model_description": "test fixture",
             "training_description": "test fixture",
         }))
         (dir_b / "helper.py").write_text('def get_digits(): return [4, 5, 6]\n')
