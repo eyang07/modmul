@@ -65,8 +65,8 @@ For the breakdown of difficulty tiers, the test-generation procedure, and the sc
 
 | Event | Date |
 |-------|------|
-| Competition opens | June 10, 2026 |
-| Submission deadline | August 10, 2026, 23:59 AoE |
+| Competition opens | June 12, 2026 |
+| Submission deadline | August 12, 2026, 23:59 AoE |
 
 ## Model Requirements
 
