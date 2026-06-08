@@ -295,6 +295,27 @@ The repository includes:
 - demo / baseline submissions (`examples/` reference models + `examples/examples.json`)
 - a step-by-step contestant guide (`examples/README.md`)
 
+## Reference Example Models
+
+The repository ships three small, **compliant** reference models under `examples/`, each a complete runnable submission (`manifest.json` + `model.py`, plus a trained `weights.pt` for the neural ones). They serve as a pipeline smoke test, a set of honest baselines, and worked examples of the prohibited-practices boundary above:
+
+| Model | What it is | overall_accuracy (public, 1100) |
+|-------|------------|---------------------------------|
+| `always_zero` | Emits `[0]` for every problem — pipeline smoke test and leaderboard floor. | 0.079 |
+| `digit_transformer` | ~544K-param decoder-only Transformer; reduces operands `mod p` inside `predict_digits`, then learns small-number modular multiplication. | 0.121 |
+| `dlp_grokking` | ~6M-param discrete-log "grokking" model: a shared residue encoder, an additive (log-space) bottleneck, and a learned decoder. | 0.127 |
+
+All three are deterministic and pass the static check. None hand-codes the arithmetic — each produces its answer through the trained model — so they sit on the compliant side of the line: the two neural models genuinely learn Tier 1 (the fixed primes `{2,3,5,7}`) and degrade honestly on the higher tiers rather than faking them. `dlp_grokking` is the most detailed worked example of turning a mathematical insight (`a*b mod p` as addition in discrete-log space) into a *learned* inductive bias.
+
+Run any of them locally:
+
+```bash
+modchallenge check    examples/dlp_grokking
+modchallenge evaluate examples/dlp_grokking --total 110
+```
+
+See `examples/README.md` for the full line-up, per-tier results, weight-reproduction steps, and the end-to-end submission guide.
+
 ## Local Testing
 
 A typical local-testing workflow:

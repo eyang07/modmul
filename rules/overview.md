@@ -61,11 +61,19 @@ This is a pure mathematical reasoning challenge. The official contract is fixed:
 
 For the breakdown of difficulty tiers, the test-generation procedure, and the scoring rules used by the official evaluation, see [evaluation.md](evaluation.md).
 
+## Official Repository
+
+All competition code — the evaluation pipeline, test-case generator, model interface, public benchmark, and runnable reference models — is open source:
+
+- [https://github.com/SAIRcompetition/modular-arithmetic-challenge](https://github.com/SAIRcompetition/modular-arithmetic-challenge)
+
+New contestants should start from `examples/`: three small, compliant reference models — a trivial `always_zero` baseline plus two trained neural models (`digit_transformer`, `dlp_grokking`) — that run end-to-end through the same pipeline used for official evaluation. `examples/README.md` is a clone-and-run walkthrough and a step-by-step submission guide. See [evaluation.md](evaluation.md#reference-example-models) for what each model does and how they illustrate the compliance boundary.
+
 ## Timeline
 
 | Event | Date |
 |-------|------|
-| Competition opens | June 12, 2026 |
+| Competition opens | June 8, 2026 |
 | Submission deadline | August 12, 2026, 23:59 AoE |
 
 ## Model Requirements
