@@ -1,7 +1,5 @@
 # Modular Arithmetic Challenge - Evaluation Setup
 
-> **We want your feedback.** The evaluation plan below — including the evaluation hardware, time budget, problem-set size, and final scoring details — is still being refined, and items marked **TBD** will be decided based on community input. Please share suggestions on the [SAIR Foundation Zulip](https://zulip.sair.foundation/).
-
 This page specifies how submissions to the Modular Arithmetic Challenge are evaluated: submission format, model interface, sandbox, evaluation pipeline, scoring, and prohibited practices.
 
 For the high-level task description, key dates, eligibility, and team / anti-cheating policy, see **[overview.md](overview.md)**.
@@ -37,7 +35,7 @@ The `output_base` field tells the harness's decoder how to interpret the digits 
 | Limit | Reference value |
 |-------|-----------------|
 | Total artifact size (weights + code + all files) | **20 GB** |
-| Total inference time for the full evaluation set | **5 minutes** for 1100 problems (TBD; subject to community input) |
+| Total inference time for the full evaluation set | **5 minutes** for 1100 problems |
 
 The repository may be private during development and must be made **public** before the official submission deadline. Private repositories are not ranked on the official leaderboard.
 
@@ -125,7 +123,7 @@ modchallenge evaluate ./my-local-model --total 110
 **Phase 2 — Final submission (public):**
 
 1. Make the HuggingFace repo **public**.
-2. Submit `repo_id` + `commit_hash` to organizers (submission portal: TBD).
+2. Submit `repo_id` + `commit_hash` to organizers.
 3. Organizers verify the repo is public, accessible, and passes the manifest schema.
 4. Organizers run official evaluation in the sandboxed environment with a **secret random seed**.
 5. Results are posted to the leaderboard.
@@ -146,7 +144,7 @@ The submitted model runs in an isolated sandbox during evaluation:
 HuggingFace repo --(loader, manifest validation)--> Sandbox --(preprocess_* / predict_digits_batch)--> Decoder --> Scorer
 ```
 
-The sandbox is a Docker container at official evaluation time. Local testing via `modchallenge evaluate-hf` currently runs **without** the sandbox (trusted-use only); contestants are expected to test against the sandbox before final submission once the Docker image is published. Sandbox image and configuration: **TBD**.
+The sandbox is a Docker container at official evaluation time. Local testing via `modchallenge evaluate-hf` currently runs **without** the sandbox (trusted-use only); contestants are expected to test against the sandbox before final submission once the Docker image is published.
 
 ## Evaluation Pipeline
 
@@ -227,12 +225,11 @@ If a model uses any source of randomness internally (sampling, dropout at infere
 
 | Resource | Reference value | Notes |
 |----------|-----------------|-------|
-| Total inference wall-clock | 5 minutes for 1100 problems | TBD; may be tuned. |
+| Total inference wall-clock | 5 minutes for 1100 problems | May be tuned before the official runs. |
 | Per-problem soft target | ~273 ms | Use `predict_digits_batch()` and GPU batching to amortize. |
-| `load()` budget | TBD | Bounded separately; not counted against the inference wall-clock. |
-| Determinism check | TBD | Bounded separately; not counted against the inference wall-clock. |
 | Total artifact size | 20 GB | Weights + code + all files. |
-| Memory | TBD | Will be set based on chosen evaluation hardware. |
+
+`load()` and the determinism check are bounded separately and are not counted against the inference wall-clock.
 
 **Wall-clock measurement (mechanical policy):**
 
@@ -247,62 +244,33 @@ If a model uses any source of randomness internally (sampling, dropout at infere
 
 ## Prohibited Practices
 
-The principle: **the model must learn to compute `(a * b) mod p`. It may not delegate, look up, or hard-code the computation.**
+**The principle: the model must *learn* to compute `(a * b) mod p` — it may not delegate, look up, or hard-code the computation.** The interface already closes the obvious paths: there is no contestant post-processor, and each preprocess hook sees only its own argument, so no single point in your code witnesses `a`, `b`, and `p` together.
 
-Many obvious attack paths are eliminated structurally by the interface — there is no contestant-written post-processor, and each preprocess hook only sees its own argument, so no single point in your code can witness `a`, `b`, and `p` simultaneously. The rules below close the remaining gaps.
+**Not allowed at inference time:**
 
-The following are **not allowed at inference time**:
+- Computing the answer with symbolic-math libraries (`sympy`, `gmpy2`, `mpmath`, `flint`, …) or with built-in big-integer arithmetic on the original `(a, b, p)` (e.g. stashing them across the preprocess hooks and recombining inside `predict_digits`).
+- **Hand-coding the arithmetic** — schoolbook multiplication, long division, Barrett/Montgomery reduction, CRT recombination over the actual `(a, b, p)` — **whether in Python integers or in tensor / array operations**. Such code is correct for *any* weights, so the weights aren't what solve the problem: that is a computational circuit, not a learned model.
+- Hard-coding answers, lookup tables indexed by the inputs, or hashes / fingerprints of the evaluation set into the weights or code.
+- **Cross-argument leakage**: a `preprocess_a` call depending on a previously-seen `b` or `p` (and likewise for the others).
+- `eval` / `exec` / `compile` / `__import__` of arbitrary modules / `ctypes`, network access, reading outside the submission directory, or spawning subprocesses.
 
-- **Computing the final answer** `(a * b) mod p` using:
-  - symbolic-math libraries: `sympy`, `gmpy2`, `mpmath`, `flint`, etc.
-  - Python's built-in arbitrary-precision integer arithmetic on the original `(a, b, p)` arguments (e.g. by stashing them in instance state across the three preprocess hooks and recombining inside `predict_digits`)
-- **Implementing the arithmetic by hand inside the model.** Computing `(a * b) mod p` with a hand-written exact algorithm over the integer values of the inputs — schoolbook / long multiplication, long division, Barrett or Montgomery reduction, CRT recombination over the actual `(a, b, p)`, and the like — **whether expressed in Python integers or in tensor / array operations**. Such code produces the correct answer for *any* weights, so the trained weights are not what solve the problem; that is a computational circuit, not a learned model. (Static analysis only catches the literal Python forms; the tensor-op forms are caught by the behavioral signals and manual review described under **Enforcement** below.)
-- **Hard-coding** test answers, lookup tables indexed by the evaluation inputs, or fingerprints / hashes of the evaluation set into the model weights or code.
-- **Cross-argument leakage in preprocessing**: a `preprocess_a` call must not depend on a previously-seen `b` or `p` value (and similarly for the others). The pipeline runs a sanity check that catches the simplest forms of this.
-- Dynamic code execution: `eval`, `exec`, `compile`, `__import__` of arbitrary modules, `ctypes`, or any other mechanism used to load or execute computation outside the model.
-- Network access of any kind.
-- Reading files outside the submission directory (other than standard runtime libraries on `sys.path`).
-- Spawning subprocesses or invoking system commands.
+**Allowed:** any per-argument representation work inside a single hook (`int()`, base conversion, modular arithmetic on small intermediates, p-adic decomposition, CRT splitting against fixed small moduli, byte encoding, …), and any *learned* computation inside the model. The constraint is not what the internal computation looks like — it is where the answer comes from.
 
-**Explicitly allowed: per-argument representation work.** Inside a single preprocess hook you may use `int()`, base conversion, modular arithmetic on small intermediate quantities, p-adic decomposition, CRT splitting against fixed small moduli, byte-level encoding, or any other standard transformation that depends **only on that hook's argument**. Inside the model you may likewise use any representation and any *learned* computation; the constraint is not on what the internal computation looks like but on where the answer comes from.
+**Two principles decide whether the model is really computing the answer:**
 
-**Two principles govern what counts as "computing the answer in the model":**
+1. **The emitted digits must materially determine the answer.** If `predict_digits` could return garbage and the answer would still come out right (e.g. precomputed in preprocessing), you are computing it outside the model.
+2. **The capability must reside in the trained parameters.** Randomizing the weights should collapse a legitimate model's accuracy, whereas a hand-coded solver keeps working — that gap is the operational test.
 
-1. **The emitted digits must materially determine the answer.** If your `predict_digits` could return arbitrary garbage and the answer would still come out correct from some other code path (e.g. precomputed during preprocessing), you are computing the answer outside the model.
-2. **The capability must reside in the trained parameters.** The map from inputs to answer must be carried by weights that were *trained*; it may not be a hand-written arithmetic algorithm whose correctness is guaranteed by construction. A useful test: randomizing the trained parameters should collapse a legitimate model's accuracy, whereas a hand-coded solver keeps working — that gap reveals the weights were never doing the work.
+This is about **provenance, not architecture.** There is no architecture whitelist: Turing-complete, recurrent, or looped models are fine, and a model that *learns* an algorithm-like circuit is exactly what this competition is looking for. A model trained to internally implement an algorithm is permitted; the same algorithm hand-coded into the forward pass is not. Genuinely borderline cases — e.g. weights hand-initialized to nearly solve the task and then barely trained — are resolved by examining *how the weights were obtained*, which is why `training_description` is required. A submission with no trained parameters is by definition a circuit, not a model.
 
-**Architecture and the model/circuit boundary.** There is no architecture whitelist, and Turing-complete, recurrent, or unbounded-state models are not prohibited as such — many legitimate iterative learners (RNNs, looped Transformers, neural algorithmic reasoners) have exactly that shape, and a model that *learns* an internally algorithm-like circuit is precisely the kind of result this competition exists to find. The line between a permitted neural model and a prohibited computational circuit is therefore not the topology but the **provenance of the computation**: the answer must be produced by parameters fit to data, not by an arithmetic procedure hand-coded into the architecture and merely wrapped as a "model." A model trained to internally implement an algorithm is permitted; the same algorithm hand-coded into the forward pass is not. The hardest cases are genuinely borderline — e.g. a network whose weights are hand-initialized to nearly implement an algorithm and then barely trained — and are resolved by examining *how the weights were obtained*, not by the architecture alone. Submissions selected for prizes or top-leaderboard recognition may be asked to describe how their weights were obtained (training or fine-tuning procedure, data, and starting point) in enough detail to establish that the capability was learned rather than hand-constructed. The required `training_description` field in `manifest.json` is where contestants declare this up front; a submission with no trained parameters at all (e.g. `"framework": "none"` and a `training_description` that openly says so) is by definition a computational circuit, not a learned model.
+**Enforcement** (layers marked *planned* are under development, to be published before the official evaluation):
 
-Borderline examples (allowed):
-
-- `int(a)` to parse the decimal string into a Python int as a step in computing its base-`q` digits inside `preprocess_a` — uses only `a`
-- `int(p) % q` for some fixed small `q` inside `preprocess_p` to set up CRT moduli — uses only `p`
-- The model emits the answer as base-256 digits, declared via `"output_base": 256` in the manifest; the harness decoder reconstructs the integer answer
-
-Borderline examples (prohibited):
-
-- Stashing `a` and `b` in `self._cache` during `preprocess_a` / `preprocess_b`, then computing `(int(self._cache['a']) * int(self._cache['b'])) % int(self._cache['p'])` inside `predict_digits` and emitting that as the answer
-- A neural model whose forward pass returns garbage but whose emitted digit list always decodes to the right answer because the digits were precomputed from `a`, `b`, `p` in preprocessing
-- A `predict_digits` implementation that ignores its inputs entirely and looks up an answer keyed by a hash of the original `(a, b, p)` it stashed earlier
-- A `predict_digits` that runs schoolbook long multiplication and long division over the parsed digits of `a`, `b`, `p` using tensor indexing and arithmetic, emitting the exact remainder — the answer is produced by a hand-coded algorithm that is correct for any weights, so it is a computational circuit, not a learned model
-
-**Enforcement layers** (the design below is the target for the official evaluation; layers marked *planned* are under active development and will be published as the implementation matures, in time for the official evaluation runs):
-
-1. **Sandbox package allowlist** *(planned)*. The evaluation sandbox is a published Docker image whose package list will be fixed and disclosed as soon as the image is finalized, so contestants can build and test against it during the competition window. The runtime initially centers on PyTorch; broader runtime support (JAX, TensorFlow, ONNX, etc.) may be added based on contestant demand. The image will not include `sympy`, `gmpy2`, `mpmath`, `flint`, or networking / subprocess libraries; `import` of any package not in the image fails at load time. Any further restrictions on the Python stdlib (if needed) will be listed in the published image spec.
-2. **Static analysis.** Every submission's source is AST-scanned before the model is loaded. The scanner flags disallowed imports, calls to `eval` / `exec` / `compile` / `__import__` / `ctypes`, and the obvious modular-product shortcut pattern `int(_) * int(_) % int(_)` (and arithmetic equivalents like `pow(int(_), int(_), int(_))`). Submissions with findings are rejected. Static analysis is intentionally narrow — it catches the easy literal patterns; subtler attempts (computation hidden inside `predict_digits` itself, or cross-argument leakage that the preprocess-isolation sanity check misses) are caught by Layer 4. Implementation: `src/modchallenge/security/static_check.py`.
-3. **Behavioral signals for review** *(planned)*. Submissions may be subject to investigative checks that produce **signals for organizer review**, not automatic disqualification:
-   - **Weight perturbation**: a graded sweep of random perturbations to the trained weights. This is the primary operational test for principle 2 above: a model whose capability lives in its weights degrades as the perturbation grows, whereas a hand-coded solver (whose correctness is independent of the weights) keeps producing the exact answer. The *shape* of the degradation curve — not a single threshold — is the signal. *Caveat:* legitimate models can be unusually robust to small perturbations, and aggressively quantized models can be fragile; this informs review rather than auto-disqualifying.
-   - **Distribution shift**: re-evaluation on a separately seeded test set drawn from the same distribution; large divergence from the official score is a possible indicator of over-fitting to a leaked seed. *Caveat:* legitimate models can also show non-trivial variance.
-   - **Latency profile**: per-problem inference time vs operand size; an essentially flat curve across tiers is a possible indicator of a constant-time shortcut. *Caveat:* aggressive batching can flatten the curve for legitimate models.
-
-   These checks inform the manual review in Layer 4 — they do not by themselves disqualify a submission.
-4. **Manual code review.** Required for top leaderboard entries and any submission flagged by Layer 2 (static analysis) or Layer 3 (behavioral signals) — **manual review does not scale with submission volume; routine submissions are not read by a human unless they are competing for a top rank or are flagged by the earlier layers**. The reviewer starts from the `model_description` and `training_description` fields in the manifest (both required, non-empty), then reads `model.py` and any auxiliary code, applying the two principles above to decide whether the answer is produced by trained parameters (permitted) or by an arithmetic algorithm hand-coded into the model (a computational circuit, prohibited). For top-ranked or flagged entries the reviewer may require the submitter's training code in addition to the declared `training_description`, sufficient to establish that the capability was learned rather than hand-constructed. A one-line stub or evasive declaration in either description field, on a top-ranked submission, is itself a signal for closer review.
+1. **Sandbox allowlist** *(planned)* — a published Docker image (PyTorch-centric) without `sympy` / `gmpy2` / `mpmath` / `flint` or networking / subprocess libraries; any unlisted `import` fails at load time.
+2. **Static analysis** — every submission is AST-scanned before load for disallowed imports, `eval` / `exec` / `compile` / `__import__` / `ctypes`, and the modular-product shortcut `int(_) * int(_) % int(_)` (and equivalents like `pow(int(_), int(_), int(_))`). Narrow by design; subtler attempts fall to Layer 4. (`src/modchallenge/security/static_check.py`)
+3. **Behavioral signals** *(planned)* — weight-perturbation sweep (the primary test for principle 2), distribution-shift re-evaluation, and latency-vs-operand-size profile. These produce **signals for review**, not automatic disqualification.
+4. **Manual review** — for top-ranked entries and anything flagged by Layers 2–3 (it does not scale to every submission). Starting from the required `model_description` / `training_description`, the reviewer reads the code to decide trained-parameters (permitted) vs hand-coded algorithm (prohibited), and may request training code for top-ranked or flagged entries.
 
 Any submission found to violate the rules is disqualified and removed from the leaderboard.
-
-## Evaluation Hardware
-
-**TBD.** The evaluation pipeline supports CPU, CUDA, and Apple MPS backends. The official evaluation hardware (CPU model, GPU model, memory, disk) and the corresponding per-tier wall-clock budget will be announced before the official evaluation runs.
 
 ## Evaluation Problem Sets
 
@@ -324,8 +292,8 @@ The repository includes:
 - the model interface and submission schema (`src/modchallenge/interface/`)
 - the leaderboard store (`src/modchallenge/leaderboard/`)
 - the public benchmark (`public_benchmark/`)
-- demo / baseline submissions (`examples/examples.json`)
-- a step-by-step contestant tutorial (`examples/tutorial.md`)
+- demo / baseline submissions (`examples/` reference models + `examples/examples.json`)
+- a step-by-step contestant guide (`examples/README.md`)
 
 ## Local Testing
 

@@ -12,21 +12,5 @@
       "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
       "description": "Weak baseline (0.5B params, Apache-2.0)"
     }
-  ],
-  "private": [
-    {
-      "name": "tiny-transformer",
-      "repo_id": "mathmodel-test/tiny-transformer",
-      "revision": "fbdf5d9b96207e0bf363878de914686e9817259e",
-      "token_env": "HF_TOKEN_TINY_TRANSFORMER",
-      "description": "Custom decoder-only Transformer (1.2M params)"
-    },
-    {
-      "name": "axolver-forked",
-      "repo_id": "mathmodel-test/axolver-forked",
-      "revision": "dcdc466d63a88a360c448794681ad1873ee2e617",
-      "token_env": "HF_TOKEN_AXOLVER_FORKED",
-      "description": "Encoder-decoder forked from AxiomMath/axolver (8M params)"
-    }
   ]
 }

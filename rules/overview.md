@@ -123,7 +123,7 @@ Submissions found to violate these rules will be disqualified. Sandbox configura
 **Team registration:**
 
 - Each individual or organization can participate in only one team.
-- Teams must register members and sponsors with organizers in advance (registration portal: TBD).
+- Teams must register members and sponsors with organizers in advance.
 - At registration, a team declares one or more HuggingFace accounts or organizations as their submission identities.
 
 **Team identity binding:**
@@ -161,4 +161,4 @@ Join the SAIR Foundation Zulip community for discussion and collaboration:
 
 ## Experimental Status
 
-This challenge is currently in an experimental phase. Rules, scoring details, and evaluation procedures may be adjusted based on implementation experience and community feedback. Items marked **TBD** in this document are open questions where we explicitly welcome community input — see **Community Feedback** above for where to weigh in.
+This challenge is currently in an experimental phase. Rules, scoring details, and evaluation procedures may be adjusted based on implementation experience and community feedback.

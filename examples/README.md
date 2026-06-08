@@ -1,6 +1,7 @@
-# Reference example models
+# Example models & submission guide
 
-Three small, **compliant** reference models that run end-to-end through the official
+This folder holds three small **compliant** reference models plus the end-to-end workflow for
+writing, testing, and submitting your own. The models run start-to-finish through the official
 pipeline (`manifest validation → static check → load → preprocess isolation → determinism →
 inference → decode → score`). They exist to (a) smoke-test a fresh setup, (b) give a floor and a
 couple of honest baselines for the leaderboard, and (c) serve as worked examples of the one rule
@@ -19,9 +20,10 @@ separate download or training step required. `always_zero` needs no weights.
 
 All three are deterministic and pass `modchallenge check`. Tier 1 (the 4 fixed primes
 `{2,3,5,7}`) is where the neural models grok cleanly; tier 2+ is the honest ceiling — see each
-README for the per-tier breakdown and why.
+model's README for the per-tier breakdown and why. The `dlp_grokking` README is the most detailed
+worked example of turning a mathematical insight into a compliant inductive bias.
 
-## Run them locally (no HuggingFace token needed)
+## Run the in-repo examples (no HuggingFace token)
 
 ```bash
 pip install -e ".[dev]"
@@ -36,6 +38,8 @@ modchallenge evaluate examples/digit_transformer --total 110
 modchallenge evaluate examples/dlp_grokking      --total 110
 ```
 
+`--total 110` = 10 per tier (11 tiers). Use `--total 1100` for a full 100-per-tier run.
+
 The weights ship in-repo, so the commands above run as-is. To **reproduce** them from scratch:
 `dlp_grokking` has a self-contained, sympy-free trainer in its own directory; `digit_transformer`'s
 trainer needs `sympy` for prime generation (blocklisted inside a submission, so it lives in the
@@ -46,18 +50,189 @@ gitignored `exploration/`):
 .venv312/bin/python examples/exploration/train_digit_transformer.py --steps 6000   # local dev only
 ```
 
-To reproduce the **public benchmark** numbers in the tables (100 problems/tier, public seed):
+To reproduce the **public benchmark** numbers in the table (100 problems/tier, public seed):
 
 ```bash
 .venv312/bin/python examples/dlp_grokking/eval_tiers.py examples/dlp_grokking
 ```
 
-## Building your own
+## Run the public HuggingFace baselines (optional, exploratory)
 
-These are minimal, honest baselines — not the ceiling. The end-to-end workflow for writing,
-testing, and submitting your own model (interface, manifest, local test, HuggingFace upload) is in
-[tutorial.md](tutorial.md). The `dlp_grokking` README is the most detailed worked example of
-turning a mathematical insight into a compliant inductive bias.
+`examples.json` registers two public LLM baselines (Qwen). They are evaluated via a generic LLM
+wrapper with a fixed prompt — an **exploratory smoke test only**, not the official ranking
+pipeline — and need no token:
+
+```bash
+modchallenge evaluate-example --group public --total 110
+modchallenge evaluate-example qwen2.5-math-1.5b --total 110   # one by name
+```
+
+## Build your own model
+
+The three examples above are minimal, honest baselines — not the ceiling. Here is the full
+workflow.
+
+### 1. Implement the interface
+
+The interface is intentionally narrow: three per-argument preprocessing hooks (each only ever
+sees its own argument) and one `predict_digits` method that emits the answer as a list of
+base-`b` digits. The harness — not your code — decodes those digits into the final answer.
+
+```python
+# model.py
+from modchallenge.interface.base_model import ModularMultiplicationModel
+
+
+class MyModel(ModularMultiplicationModel):
+    def load(self, model_dir: str) -> None:
+        # Load your trained weights
+        ...
+
+    # Per-argument preprocessing. Each hook only sees its own argument.
+    # Defaults are identity (pass the string through unchanged); override
+    # to tokenise, embed, do base conversion, etc.
+    def preprocess_a(self, a: str):
+        return [int(c) for c in a]   # e.g. digit-level tokens
+
+    def preprocess_b(self, b: str):
+        return [int(c) for c in b]
+
+    def preprocess_p(self, p: str):
+        return [int(c) for c in p]
+
+    def predict_digits(self, a_enc, b_enc, p_enc) -> list[int]:
+        # Run the model on the encoded inputs. Return the answer
+        # (a * b mod p) as base-b digits, MOST-SIGNIFICANT-FIRST.
+        # b = the value declared in manifest.json's output_base field.
+        # For example, with output_base = 10 and answer = 52, return [5, 2].
+        ...
+
+    def predict_digits_batch(self, inputs) -> list[list[int]]:
+        # Optional: override for GPU batching (default loops over predict_digits).
+        ...
+
+    def max_batch_size(self) -> int:
+        return 64
+```
+
+Create a `manifest.json` declaring your entry class and the base you emit answers in:
+
+```json
+{
+  "entry_class": "model.MyModel",
+  "output_base": 10,
+  "model_description": "4-layer decoder-only Transformer, ~1.2M params, digit-level tokens for a/b/p, autoregressive decode of answer digits in base 10",
+  "training_description": "trained from random init on 1M synthetic (a, b, p, a*b mod p) examples; digit-level tokenisation; AdamW, ~10k steps"
+}
+```
+
+Allowed `output_base` values:
+
+- any integer in `[2, 2^32]` — for example `2` (binary), `10` (decimal digits), `256` (bytes), `65536` (word-level), etc.
+- the string `"p"` — answers are emitted in base equal to the current prime, so each answer is a single digit in `[0, p)`
+
+Your submission directory:
+
+```
+my-model/
+├── manifest.json
+├── model.py
+└── weights.pt (or any model files)
+```
+
+### The one rule that matters
+
+Your model must **learn** to compute `(a * b) mod p` — the answer must come from trained
+parameters. You may use any architecture and any internal representation, but you may **not**
+hand-code the arithmetic (schoolbook long multiplication, long division, Montgomery/Barrett
+reduction, CRT recombination) over the input values — **whether in Python integers or in tensor
+operations**. Such code returns the right answer regardless of the weights, which makes it a
+computational circuit, not a learned model. There is also no contestant-side decoding step: your
+only output is the base-`b` digit list, and the harness converts it to the answer.
+
+The full boundary, the two governing principles, and the enforcement (static analysis,
+weight-perturbation signal, manual review) are in
+[../rules/evaluation.md](../rules/evaluation.md#prohibited-practices). Every `manifest.json` must
+include two **required** non-empty fields that reviewers read first: `model_description` (what the
+model is — architecture, approximate parameter count, input/output representation, key design
+choices) and `training_description` (how the weights were obtained — training or fine-tuning
+procedure, data, starting point). Routine submissions don't go through manual code review; it's
+reserved for top-ranked entries and submissions flagged by static analysis or the behavioral
+signals.
+
+### 2. Test locally
+
+```bash
+modchallenge evaluate ./my-model --total 110
+```
+
+### 3. Upload to a private HuggingFace repo
+
+```bash
+pip install huggingface_hub
+huggingface-cli login
+
+python -c "
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo('your-username/my-model', private=True)
+api.upload_folder(folder_path='./my-model', repo_id='your-username/my-model')
+"
+```
+
+Create a **fine-grained read-only token** for your repo at
+https://huggingface.co/settings/tokens — this lets you test without exposing write access.
+
+### 4. Test via HuggingFace (private)
+
+Get your commit hash, then run the same pipeline organizers will use:
+
+```bash
+python -c "
+from huggingface_hub import HfApi
+print(HfApi().repo_info('your-username/my-model').sha)
+"
+
+modchallenge evaluate-hf your-username/my-model <commit_hash> --token hf_xxx --total 110
+```
+
+If it works here, it will work in official evaluation.
+
+### 5. Iterate
+
+```
+Improve model -> push to HF -> get new commit hash -> re-test
+```
+
+Each push creates a new commit hash. The old hash still points to the old version — nothing is
+overwritten.
+
+### 6. Share via Contributor Network (optional)
+
+During the competition, share your model through the
+[SAIR Contributor Network](https://competition.sair.foundation/contributor-network):
+
+- Make your HF repo public (or create a new public repo for sharing)
+- Submit repo_id + commit_hash via the Contributor Network
+- Organizers evaluate your model and publish results; the community can give feedback
+
+### 7. Final submission
+
+Before the deadline:
+
+1. Make your HF repo **public**
+2. Submit `repo_id` + `commit_hash` to organizers
+3. Organizers run official evaluation with a secret random seed
+4. Results posted to the leaderboard
+
+## Tips
+
+- Start with `--total 110` (10 per tier) for fast iteration, use `--total 1100` for thorough testing
+- Use `--seed <hex>` to get reproducible results across runs
+- Check Tier 0 results to diagnose whether failures come from multiplication or modular reduction
+- The preprocessing hooks each see decimal strings — `a` and `b` can be hundreds of digits long (much larger than `p`); `p` is up to ~617 digits
+- If your model uses GPU batching, override `predict_digits_batch()` and `max_batch_size()`
+- The pipeline runs a sanity check that catches obviously stateful preprocessing (e.g. caching `a` in instance state so a later hook can read it) — design your preprocessing as pure per-argument functions
 
 ## Not in this folder
 

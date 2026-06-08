@@ -40,8 +40,11 @@ src/modchallenge/
   cli.py            CLI entry point
 
 examples/
-  examples.json       Model registry (public + private HF repos)
-  tutorial.md         Step-by-step guide from setup to submission
+  examples.json       Public HF baseline registry (Qwen)
+  README.md           Reference models + step-by-step submission guide
+  always_zero/        Compliant baseline: emits [0]
+  digit_transformer/  Compliant baseline: ~544K-param Transformer
+  dlp_grokking/       Compliant baseline: ~6M-param discrete-log model
 
 rules/
   overview.md       Competition rules, background, scoring, anti-cheating policy
