@@ -1,0 +1,1 @@
+{"entry_class": "model.AlwaysZero", "output_base": 10, "model_description": "baseline; trivial constant predictor that always emits digit 0", "training_description": "baseline; no training, always returns digit 0"}

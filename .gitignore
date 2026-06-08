@@ -49,5 +49,10 @@ leaderboard.json
 *.gguf
 *.onnx
 
+# Exception: the three compliant reference models ship their weights in-repo
+# so the examples are clone-and-run without a separate download.
+!examples/digit_transformer/weights.pt
+!examples/dlp_grokking/weights.pt
+
 # Local example exploration (not for distribution until approved)
 examples/exploration/

@@ -34,6 +34,23 @@ modchallenge evaluate-example --total 110
 
 If the private examples run, your setup is correct and your own submissions will work the same way.
 
+### In-repo reference models (no HuggingFace token)
+
+Three small **compliant** models ship in the repo so you can see a full, passing submission
+without any HF setup — `examples/always_zero/`, `examples/digit_transformer/`, and
+`examples/dlp_grokking/`. Each has a `manifest.json`, `model.py`, and a `README.md`; run them
+straight from the working tree:
+
+```bash
+modchallenge check    examples/dlp_grokking          # static compliance check
+modchallenge evaluate examples/dlp_grokking --total 110
+```
+
+See [examples/README.md](README.md) for the line-up, scores, and how to reproduce the weights
+(which ship in-repo, so the examples run as-is). `dlp_grokking` is the most detailed worked example of turning a mathematical
+insight — `a*b mod p` as addition in discrete-log space — into a *learned* inductive bias that
+stays on the right side of the one rule below.
+
 ## Build Your Own Model
 
 ### 1. Implement the Interface
