@@ -2,7 +2,7 @@
 
 ## What is This Competition?
 
-The Modular Arithmetic Challenge asks a simple question: **can a neural network learn to do modular multiplication?**
+The Modular Arithmetic Challenge asks a simple question: **can a neural network learn to do modular multiplication efficiently?**
 
 Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. All values are decimal strings. The operands can be hundreds of digits long — far beyond what fits in a 64-bit integer.
 

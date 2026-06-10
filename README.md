@@ -1,6 +1,6 @@
 # Modular Arithmetic Challenge
 
-Can a neural network learn modular multiplication?
+Can a neural network learn modular multiplication efficiently?
 
 Given two large integers `a`, `b` and a prime `p`, compute `(a * b) mod p`. Operands can be hundreds of digits long — far beyond what fits in a 64-bit integer. Your model must **learn** to compute the answer — the answer must come from trained parameters, not from symbolic-math libraries, Python's built-in arbitrary-precision arithmetic, or an arithmetic algorithm hand-coded over the inputs (in Python **or** tensor operations). Submissions implement a narrow interface (three per-argument preprocessing hooks plus `predict_digits` returning the answer as base-`b` digits); the harness-provided decoder does the rest. See [rules/overview.md](rules/overview.md#prohibited-practices) for the precise rules.
 
