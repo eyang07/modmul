@@ -87,6 +87,65 @@ def angular_decode(pred: torch.Tensor, p_int: torch.Tensor) -> torch.Tensor:
     t = torch.round(theta * p_int.float() / (2 * math.pi))
     return (t % p_int.float()).long()
 
+
+# -- E6: algebraic-consistency losses (ring/group axioms; Kona-inspired) ------
+
+def _ints_to_digits(n: torch.Tensor) -> torch.Tensor:
+    """(B,) int tensor -> (B, WIDTH) MSB-first decimal digits."""
+    pv = torch.tensor(_PV, device=n.device)
+    return ((n.unsqueeze(1) // pv) % 10).long()
+
+
+def _unit_vec(out: torch.Tensor, p_int: torch.Tensor, mode: str) -> torch.Tensor:
+    """Map a model output to a unit vector on the circle (the predicted residue's
+    angle). For angular: normalise the 2-vector. For cls/cls_pp: circular mean of
+    the softmax over residue classes (class c -> angle 2*pi*c/p), then normalise."""
+    if mode == "angular":
+        u = out
+    else:
+        k = out.shape[1]
+        cls_idx = torch.arange(k, device=out.device).unsqueeze(0).float()   # (1,K)
+        ang = (2 * math.pi) * cls_idx / p_int.unsqueeze(1).float()          # (B,K)
+        probs = torch.softmax(out, dim=-1) * (cls_idx < p_int.unsqueeze(1).float())
+        ux = (probs * torch.cos(ang)).sum(1)
+        uy = (probs * torch.sin(ang)).sum(1)
+        u = torch.stack([ux, uy], dim=1)
+    return u / u.norm(dim=1, keepdim=True).clamp_min(1e-6)
+
+
+def _cmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Complex multiplication of (B,2) unit vectors: adds their angles."""
+    return torch.stack(
+        [a[:, 0] * b[:, 0] - a[:, 1] * b[:, 1], a[:, 0] * b[:, 1] + a[:, 1] * b[:, 0]],
+        dim=1,
+    )
+
+
+def alg_consistency_loss(model, out_xy, x, y, p, mode: str) -> torch.Tensor:
+    """Self-supervised structural penalties (no labels):
+
+    - commutativity:  f(x,y) == f(y,x)
+    - distributivity: x*y + x*z == x*(y+z) (mod p), which in angle space is the
+      complex-product identity u(x,y) * u(x,z) == u(x,(y+z) mod p).
+
+    Both regularise the model on the *whole* residue grid, pushing it to satisfy
+    the ring axioms (= learn the algorithm) rather than memorise. Adds 3 forwards.
+    """
+    p_int = digits_to_int(p)
+    u_xy = _unit_vec(out_xy, p_int, mode)
+    # commutativity
+    u_yx = _unit_vec(model(y, x, p), p_int, mode)
+    comm = ((u_xy - u_yx) ** 2).sum(1).mean()
+    # distributivity: sample z in [0,p), build s = (y+z) mod p
+    y_int = digits_to_int(y)
+    z_int = (torch.rand(x.shape[0], device=x.device) * p_int.float()).floor().long()
+    z_int = torch.minimum(z_int, p_int - 1)
+    s_int = (y_int + z_int) % p_int
+    u_xz = _unit_vec(model(x, _ints_to_digits(z_int), p), p_int, mode)
+    u_xs = _unit_vec(model(x, _ints_to_digits(s_int), p), p_int, mode)
+    dist = ((_cmul(u_xy, u_xz) - u_xs) ** 2).sum(1).mean()
+    return comm + dist
+
 CKPT_DIR = HERE / "checkpoints"
 
 
@@ -131,6 +190,9 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.01, help="weight decay (key grokking lever)")
+    ap.add_argument("--alg-consistency", type=float, default=0.0,
+                    help="weight for E6 algebraic-consistency loss (commutativity + "
+                         "distributivity); 0 = off. Only for cls/cls_pp/angular.")
     ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--eval-every", type=int, default=250)
@@ -218,6 +280,9 @@ def main() -> int:
             loss = angular_loss(out, digits_to_int(ans), digits_to_int(p))
         else:
             loss = loss_fn(out.reshape(-1, 10), ans.reshape(-1))  # digit heads
+
+        if args.alg_consistency > 0 and mode in ("cls", "cls_pp", "angular"):
+            loss = loss + args.alg_consistency * alg_consistency_loss(model, out, x, y, p, mode)
         opt.zero_grad()
         loss.backward()
         opt.step()
