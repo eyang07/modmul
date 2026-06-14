@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Local training run logs (transient; findings captured in TIER3_EXPERIMENTS.md)
+*.log
 *.egg-info/
 *.egg
 dist/
