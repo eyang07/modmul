@@ -1,0 +1,7 @@
+{
+  "entry_class": "model.EBMModMul",
+  "output_base": 10,
+  "framework": "pytorch",
+  "model_description": "Joint-attention Transformer (~3.2M params, d_model=256, 4-6 layers, 8 heads) that learns x*y mod p for small primes. Operands are reduced per-argument (a%p, b%p) inside predict_digits, then the residues and prime are encoded as fixed-width decimal digits in a single self-attention sequence; a CLS slot reads out the answer residue via either a classification head (residue class in [0, p_max)) or an angular head ((cos,sin) on the unit circle, decoded to the nearest residue). Answer emitted as base-10 digits. Targets tiers 1-3; emits [0] for p >= 1e5 (out of the fixed-width regime).",
+  "training_description": "Trained from random init on synthetic (x, y, p, x*y mod p) examples with x,y in [0,p), over the full enumerable prime pools of tiers 1-3. Cross-entropy (classification head) or angular distance loss (Saxena-Charton circle encoding) with AdamW and weight decay; a fixed-dataset + weight-decay 'grokking' regime is used to push within-prime generalization. No hand-coded arithmetic: the modular product is produced by the trained network (randomizing weights collapses accuracy)."
+}
