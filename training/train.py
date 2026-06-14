@@ -135,6 +135,9 @@ def main() -> int:
     ap.add_argument("--fixed-per-prime", type=int, default=0,
                     help="0 = infinite fresh stream; >0 = grokking recipe on a fixed "
                          "set of this many (x,y) pairs per prime")
+    ap.add_argument("--max-primes", type=int, default=0,
+                    help="0 = all; else cap each tier's TRAIN pool to this many primes "
+                         "(for the cheap E2 linchpin: e.g. 8). Held-out val primes unaffected.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", type=str, default="", help="checkpoint name; default derives from arch+tiers")
     args = ap.parse_args()
@@ -144,6 +147,9 @@ def main() -> int:
     tiers = tuple(args.tiers)
     holdout = 0.1 if args.holdout else 0.0
     split = build_prime_split(tiers, holdout_frac=holdout, seed=args.seed)
+    if args.max_primes > 0:
+        for t in tiers:
+            split.train[t] = split.train[t][: args.max_primes]
 
     # Curriculum weights: bias toward the harder/larger tier once tier 1 is easy.
     # Tier 1 has only 4 primes so it groks fast; give tier 2 the bulk of samples.
