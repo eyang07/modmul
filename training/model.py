@@ -316,3 +316,92 @@ class JointModMulNetAngular(nn.Module):
         x = self.encoder(x)
         x = self.ln(x)
         return self.head(x[:, -1, :])  # (B, 2)
+
+
+# ---------------------------------------------------------------------------
+# Per-prime conditioning (a learned embedding per prime)
+# ---------------------------------------------------------------------------
+
+# Covers every prime that can appear in tiers 1-3 (p < 2**16). Tier-3 max prime
+# is < 65536; tier-4 primes start at 2**17, so nothing falls in [65536, 131072).
+PRIME_ENUM_LIMIT = 65536
+
+
+def _sieve_primes(limit: int) -> list[int]:
+    is_p = bytearray([1]) * limit
+    is_p[0] = is_p[1] = 0
+    for i in range(2, int(limit ** 0.5) + 1):
+        if is_p[i]:
+            is_p[i * i :: i] = bytearray(len(is_p[i * i :: i]))
+    return [i for i in range(2, limit) if is_p[i]]
+
+
+class JointModMulNetClsPP(nn.Module):
+    """Joint-attention classifier with a **learned per-prime embedding**.
+
+    The shared network conditioned only on prime *digits* caps ~0.71 on tier 2
+    because it must encode ~44 different multiplication tables through one
+    p-digit pathway. Here each prime additionally gets a dedicated learned vector
+    (indexed by the prime's rank among all primes < PRIME_ENUM_LIMIT), broadcast
+    over the sequence — giving every prime its own "slot" while sharing the
+    multiplication circuit. Compliant: the embedding is learned conditioning, not
+    an answer lookup (randomising weights still collapses accuracy).
+
+    The prime index is computed *inside* forward from the prime digits, so the
+    signature stays ``(x, y, p)`` — a drop-in for the plain cls head.
+    """
+
+    def __init__(self, d_model=256, nhead=8, num_layers=6, dim_ff=1024, p_max=256):
+        super().__init__()
+        self.p_max = p_max
+        self.limit = PRIME_ENUM_LIMIT
+        self.tok_emb = nn.Embedding(VOCAB_SIZE, d_model)
+        self.cls_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
+        self.seg_emb = nn.Embedding(4, d_model)
+        self.pos_emb = nn.Embedding(3 * WIDTH + 1, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=0.0, batch_first=True, activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, p_max)
+        self.config = dict(d_model=d_model, nhead=nhead, num_layers=num_layers,
+                           dim_ff=dim_ff, p_max=p_max)
+
+        # Per-prime embedding + a (non-trained) prime -> index lookup.
+        primes = _sieve_primes(self.limit)
+        self.prime_emb = nn.Embedding(len(primes), d_model)
+        idx = torch.zeros(self.limit, dtype=torch.long)
+        valid = torch.zeros(self.limit, dtype=torch.float)
+        for rank, p in enumerate(primes):
+            idx[p] = rank
+            valid[p] = 1.0
+        self.register_buffer("idx_lookup", idx, persistent=False)
+        self.register_buffer("valid_lookup", valid, persistent=False)
+        self.register_buffer(
+            "place_value",
+            torch.tensor([10 ** (WIDTH - 1 - i) for i in range(WIDTH)], dtype=torch.long),
+            persistent=False,
+        )
+        seg = torch.tensor([SEG_X] * WIDTH + [SEG_Y] * WIDTH + [SEG_P] * WIDTH + [SEG_ANS])
+        self.register_buffer("seg_ids", seg, persistent=False)
+        self.register_buffer("pos_ids", torch.arange(3 * WIDTH + 1), persistent=False)
+
+    def forward(self, x_digits, y_digits, prime_digits):
+        b = x_digits.shape[0]
+        # Reconstruct p from its digits and fetch the learned per-prime vector.
+        p_int = (prime_digits * self.place_value).sum(dim=1)        # (B,)
+        safe = p_int.clamp(0, self.limit - 1)
+        p_emb = self.prime_emb(self.idx_lookup[safe])              # (B, d)
+        p_emb = p_emb * self.valid_lookup[safe].unsqueeze(-1)      # zero if out of range
+
+        inp = torch.cat([x_digits, y_digits, prime_digits], dim=1)
+        tok = self.tok_emb(inp)
+        cls = self.cls_query.unsqueeze(0).expand(b, 1, -1)
+        x = torch.cat([tok, cls], dim=1)
+        x = x + self.seg_emb(self.seg_ids.unsqueeze(0)) + self.pos_emb(self.pos_ids.unsqueeze(0))
+        x = x + p_emb.unsqueeze(1)  # broadcast per-prime conditioning to all positions
+        x = self.encoder(x)
+        x = self.ln(x)
+        return self.head(x[:, -1, :])  # (B, p_max)

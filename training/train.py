@@ -42,6 +42,7 @@ import math  # noqa: E402
 
 from model import (  # noqa: E402
     ModMulNet, JointModMulNet, JointModMulNetCls, JointModMulNetAngular,
+    JointModMulNetClsPP,
 )
 from data import WIDTH  # noqa: E402
 
@@ -49,6 +50,7 @@ ARCHS = {
     "additive": ModMulNet,
     "joint": JointModMulNet,
     "cls": JointModMulNetCls,
+    "cls_pp": JointModMulNetClsPP,   # per-prime embedding
     "angular": JointModMulNetAngular,
 }
 
@@ -102,7 +104,7 @@ def score_batch(model, x, y, p, ans, mode: str) -> float:
     if x.shape[0] == 0:
         return float("nan")
     out = model(x, y, p)
-    if mode == "cls":
+    if mode in ("cls", "cls_pp"):
         return (out.argmax(dim=-1) == digits_to_int(ans)).float().mean().item()
     if mode == "angular":
         return (angular_decode(out, digits_to_int(p)) == digits_to_int(ans)).float().mean().item()
@@ -162,7 +164,7 @@ def main() -> int:
               f"val(unseen) primes={len(split.val_primes[t]) if holdout else 0}")
 
     mode = args.arch
-    is_cls = mode == "cls"
+    is_cls = mode in ("cls", "cls_pp")
     kw = dict(d_model=args.d_model, num_layers=args.layers)
     if is_cls:
         kw["p_max"] = args.p_max
@@ -210,7 +212,7 @@ def main() -> int:
         else:
             x, y, p, ans = make_batch(split.train, tier_weights, args.batch, rng, device)
         out = model(x, y, p)
-        if mode == "cls":
+        if mode in ("cls", "cls_pp"):
             loss = loss_fn(out, digits_to_int(ans))            # (B, p_max) vs (B,)
         elif mode == "angular":
             loss = angular_loss(out, digits_to_int(ans), digits_to_int(p))

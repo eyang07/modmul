@@ -119,7 +119,76 @@ class JointModMulNetAngular(nn.Module):
         return self.head(x[:, -1, :])  # (B, 2)
 
 
-_ARCHS = {"cls": JointModMulNetCls, "angular": JointModMulNetAngular}
+PRIME_ENUM_LIMIT = 65536
+
+
+def _sieve_primes(limit: int) -> list[int]:
+    is_p = bytearray([1]) * limit
+    is_p[0] = is_p[1] = 0
+    for i in range(2, int(limit ** 0.5) + 1):
+        if is_p[i]:
+            is_p[i * i :: i] = bytearray(len(is_p[i * i :: i]))
+    return [i for i in range(2, limit) if is_p[i]]
+
+
+class JointModMulNetClsPP(nn.Module):
+    """Joint-attention classifier with a learned per-prime embedding.
+    Mirrors training/model.py for state_dict compatibility."""
+
+    def __init__(self, d_model=256, nhead=8, num_layers=6, dim_ff=1024, p_max=256):
+        super().__init__()
+        self.p_max = p_max
+        self.limit = PRIME_ENUM_LIMIT
+        self.tok_emb = nn.Embedding(VOCAB_SIZE, d_model)
+        self.cls_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
+        self.seg_emb = nn.Embedding(4, d_model)
+        self.pos_emb = nn.Embedding(3 * WIDTH + 1, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=0.0, batch_first=True, activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, p_max)
+        primes = _sieve_primes(self.limit)
+        self.prime_emb = nn.Embedding(len(primes), d_model)
+        idx = torch.zeros(self.limit, dtype=torch.long)
+        valid = torch.zeros(self.limit, dtype=torch.float)
+        for rank, p in enumerate(primes):
+            idx[p] = rank
+            valid[p] = 1.0
+        self.register_buffer("idx_lookup", idx, persistent=False)
+        self.register_buffer("valid_lookup", valid, persistent=False)
+        self.register_buffer(
+            "place_value",
+            torch.tensor([10 ** (WIDTH - 1 - i) for i in range(WIDTH)], dtype=torch.long),
+            persistent=False,
+        )
+        seg = torch.tensor([SEG_X] * WIDTH + [SEG_Y] * WIDTH + [SEG_P] * WIDTH + [SEG_ANS])
+        self.register_buffer("seg_ids", seg, persistent=False)
+        self.register_buffer("pos_ids", torch.arange(3 * WIDTH + 1), persistent=False)
+
+    def forward(self, x_digits, y_digits, prime_digits):
+        b = x_digits.shape[0]
+        p_int = (prime_digits * self.place_value).sum(dim=1)
+        safe = p_int.clamp(0, self.limit - 1)
+        p_emb = self.prime_emb(self.idx_lookup[safe]) * self.valid_lookup[safe].unsqueeze(-1)
+        inp = torch.cat([x_digits, y_digits, prime_digits], dim=1)
+        tok = self.tok_emb(inp)
+        cls = self.cls_query.unsqueeze(0).expand(b, 1, -1)
+        x = torch.cat([tok, cls], dim=1)
+        x = x + self.seg_emb(self.seg_ids.unsqueeze(0)) + self.pos_emb(self.pos_ids.unsqueeze(0))
+        x = x + p_emb.unsqueeze(1)
+        x = self.encoder(x)
+        x = self.ln(x)
+        return self.head(x[:, -1, :])
+
+
+_ARCHS = {
+    "cls": JointModMulNetCls,
+    "cls_pp": JointModMulNetClsPP,
+    "angular": JointModMulNetAngular,
+}
 
 
 def _angular_decode(pred: torch.Tensor, p_int: torch.Tensor) -> torch.Tensor:
