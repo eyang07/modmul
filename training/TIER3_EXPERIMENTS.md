@@ -79,3 +79,88 @@ to push borderline residues over the 90% line. EBM only earns its keep here, not
 - Each run writes a unique checkpoint (`--tag`, else `arch_tNN`), so experiments don't collide.
 - `WIDTH=5` already covers tier-3 values (<65536). Tier 4+ (p up to 2³²) will need a wider input
   encoding and rules out both `cls` and fine-angular — a later problem.
+
+---
+
+# Energy-based ideas (from Kona / IREM / IRED)
+
+Kona ([Logical Intelligence](https://logicalintelligence.com/blog/energy-based-model-sudoku-demo),
+open repro [Enso](https://github.com/MVPandey/Enso)) solves Sudoku at 96% via an energy landscape +
+Langevin "thinking". **Honest scope:** that headline mechanism (gradient descent over the answer)
+does *not* transfer here — Sudoku is a constraint-satisfaction problem with local, decomposable,
+cheap-to-verify constraints, so its energy has a navigable landscape; `x·y mod p` has none (verifying
+a candidate residue = recomputing the whole answer, so the landscape is a spike). EBMs win when
+verification ≪ generation; for us verification ≈ generation. So we borrow the *parts that fit*, not
+the Langevin search.
+
+## E6 — Algebraic-consistency losses (Kona's real lever: the differentiable constraint loss)
+
+Kona's power is its **constraint loss** (Sudoku uniqueness), not the sampling. Our analog: `x·y mod p`
+obeys ring/group axioms, which are **differentiable self-consistency constraints on the model's own
+outputs** — no ground-truth labels, so they apply to *unlimited unlabeled* `(x,y,p)` triples
+(including held-out residue pairs) and push within-prime generalization (= grokking) directly.
+**Training-time only; inference stays a single forward pass → fully compliant** (no hand-coded
+arithmetic; these are regularizers on the model's outputs). This is the highest-value borrow and
+the most direct "make it learn the algorithm" lever.
+
+Let `f(x,y,p)` be the model's predicted answer. Add (weight λ each):
+
+- **Commutativity** (self-supervised, label-free): `f(x,y,p) ≈ f(y,x,p)`. Penalize disagreement
+  between the two forward passes — symmetric KL on `cls` logits, or `‖·‖²` on angular unit vectors.
+  Applies to *any* `(x,y)`, so it regularizes the whole grid, not just sampled/labeled pairs.
+- **Identity / absorbing** (cheap labeled anchors): `f(x,1,p)=x`, `f(x,0,p)=0` (+ symmetric). CE to
+  the known residue.
+- **Distributivity** (self-supervised; cleanest with `--arch angular`): `x·y + x·z ≡ x·(y+z) (mod p)`.
+  With angular outputs `u(·) = e^{2πi f(·)/p}` (unit vectors), this is exactly the **complex-product
+  identity** `u(x,y)·u(x,z) = u(x,(y+z) mod p)`, so
+  `L_distrib = ‖cmul(u(x,y,p), u(x,z,p)) − u(x,(y+z)%p,p)‖²` over three forward passes. (The angular
+  encoding turns a modular *additive* identity into a clean differentiable constraint — a strong
+  reason to favour angular for tiers 3+.)
+
+**Hypothesis:** commutativity + distributivity force *global* algebraic consistency (which is what a
+real multiplication algorithm has), closing the train-fit → within-prime-unseen gap faster and
+lifting cross-prime transfer.
+
+**Build:** `--alg-consistency λ` in train.py; run the extra forward passes (commutativity: swap x,y;
+distributivity: sample z, compute `(y+z)%p` in the *data pipeline*, never in the submission) and add
+the penalties. **Measure** within-prime-unseen / cross-prime vs the no-consistency baseline at matched
+steps on the E2 8-prime setup. **Decision:** if it materially lifts within-prime-unseen, make it
+default and scale to E3.
+
+## E7 — Energy re-ranking verifier (Kona's "pick the lowest-energy chain", minus Langevin)
+
+This is E5 made concrete. An energy head `g(rep, c)` scores a candidate residue `c` against the
+shared encoder representation `rep`; output `argmin_c g`.
+
+- **Candidates:** the predictor's top-K residues (top-K `cls` logits; for angular, the K residues
+  nearest the predicted angle).
+- **Training:** margin/contrastive — `g(rep, true) + m ≤ g(rep, c)` for hard negatives
+  `c ∈ {true±1, near-residues, the predictor's own top-K mistakes}`.
+- **Inference:** deterministic argmin over K candidates (one extra small-head forward) — fits the
+  ~273 ms/problem budget.
+
+**When:** pure last-mile exactness — only pays off once the predictor is ~80–88% on a tier
+(converts near-miss → ≥90%). Build right after a tier lands in that band. **Decision:** does
+re-ranking lift exact-match over plain argmax near the 90% boundary?
+
+## E8 — (frontier) Manufacture a CSP so iterative "thinking" actually applies
+
+The only way to port Kona's iterative energy descent is to give the problem the *local constraint
+structure* it natively lacks: reframe the computation over an intermediate representation with local
+consistencies — a **digit/carry lattice** (learned carry-consistency potentials) or a **CRT/RNS
+residue system** — and do unrolled energy minimisation (IREM: backprop through T refinement steps;
+IRED: anneal + adapt step count to difficulty).
+
+**Risk/compliance — high:** the local potentials must be *learned* (randomising weights must break
+it); hand-coded carry/Barrett/CRT logic makes it a forbidden circuit. Seed any noise (determinism);
+T steps × batch must fit the latency budget. **Park until tier 3 is in hand and E6/E7 are
+exhausted** — this is the high-risk/high-reward novel-approach bet for tiers 4–5.
+
+Reading: IREM ([2206.15448](https://arxiv.org/abs/2206.15448)),
+IRED ([2406.11179](https://arxiv.org/abs/2406.11179)),
+Energy-Based Transformers ([2507.02092](https://arxiv.org/pdf/2507.02092)).
+
+## Priority order
+E6 (algebraic-consistency) is the next build after the tier-2 / E2 numbers land — biggest expected
+lift on generalisation, low risk, directly "learns the algorithm". E7 (verifier) follows the moment a
+tier sits at 80–88%. E8 is a later frontier bet.
