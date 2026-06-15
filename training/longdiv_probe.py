@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import os
 import random
 import time
@@ -265,6 +266,8 @@ def main() -> int:
                     help="path to save training state (latest) + a _best.pt copy; '' disables")
     ap.add_argument("--resume", action="store_true",
                     help="resume model/opt/sched/step from --ckpt if it exists")
+    ap.add_argument("--amp", action="store_true",
+                    help="bf16 autocast on CUDA (~1.5-2x faster on Ada/Ampere)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -331,6 +334,11 @@ def main() -> int:
         start_step, best = ck["step"], ck.get("best", -1.0)
         print(f"resumed from {args.ckpt} at step {start_step} (best {best:.3f})")
 
+    use_amp = args.amp and device.type == "cuda"
+    amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if use_amp else contextlib.nullcontext())
+    if use_amp:
+        print("bf16 autocast ON")
     start = time.monotonic()
 
     for step in range(start_step + 1, args.steps + 1):
@@ -338,11 +346,12 @@ def main() -> int:
         hi = bisect.bisect_left(POOL, cur_pmax(step))
         primes_now = POOL[:hi] if hi > 0 else POOL[:1]
         toks, abac, mask = make_batch(args.batch, primes_now, max_len, rng, device)
-        logits = model(toks, abac)
-        logits = logits[:, :-1].reshape(-1, VOCAB)
-        target = toks[:, 1:].reshape(-1)
-        m = mask[:, 1:].reshape(-1)
-        loss = loss_fn(logits[m], target[m])
+        with amp_ctx:
+            logits = model(toks, abac)
+            logits = logits[:, :-1].reshape(-1, VOCAB)
+            target = toks[:, 1:].reshape(-1)
+            m = mask[:, 1:].reshape(-1)
+            loss = loss_fn(logits[m], target[m])
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
 
         if step % args.eval_every == 0:
