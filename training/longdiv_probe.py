@@ -249,6 +249,10 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=40000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--warmup", type=int, default=2000,
+                    help="linear LR warmup steps (stabilizes deep models)")
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="max grad norm; <=0 disables")
     ap.add_argument("--d-model", type=int, default=384)
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--nhead", type=int, default=8)
@@ -311,7 +315,20 @@ def main() -> int:
           f"params {n_params:,}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps, eta_min=args.lr * 0.1)
+    warmup = max(0, min(args.warmup, args.steps - 1))
+    if warmup > 0:
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=0.01, end_factor=1.0, total_iters=warmup),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=args.steps - warmup, eta_min=args.lr * 0.1),
+            ],
+            milestones=[warmup])
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=args.steps, eta_min=args.lr * 0.1)
     loss_fn = nn.CrossEntropyLoss()
 
     cfg = dict(d_model=args.d_model, layers=args.layers, nhead=args.nhead,
@@ -352,7 +369,10 @@ def main() -> int:
             target = toks[:, 1:].reshape(-1)
             m = mask[:, 1:].reshape(-1)
             loss = loss_fn(logits[m], target[m])
-        opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+        opt.zero_grad(); loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        opt.step(); sched.step()
 
         if step % args.eval_every == 0:
             parts, rems = [], []
