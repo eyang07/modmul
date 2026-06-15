@@ -88,13 +88,23 @@ def sample_operand(n_digits: int, rng: random.Random) -> int:
     return rng.randrange(10 ** (n_digits - 1), 10 ** n_digits)
 
 
-def make_batch(batch: int, min_d: int, max_d: int, max_len: int, rng, device):
+def make_batch(batch: int, min_d: int, max_d: int, max_len: int, rng, device,
+               hard_frac: float = 0.0):
     """Sample operands with digit-lengths uniform in [min_d, max_d] (balances
-    lengths; plain integer sampling over-represents the longest length)."""
+    lengths; plain integer sampling over-represents the longest length).
+
+    hard_frac: fraction of examples that FORCE both operands to max_d digits. The
+    uniform scheme makes max_d x max_d only 1/(span^2) of the batch -- the hardest,
+    rarest corner -- which is exactly where one-shot multiply hits a length cliff.
+    Oversampling it drills that corner without losing coverage of shorter operands.
+    """
     T, A, M = [], [], []
     for _ in range(batch):
-        dx = rng.randint(min_d, max_d)
-        dy = rng.randint(min_d, max_d)
+        if hard_frac > 0.0 and rng.random() < hard_frac:
+            dx = dy = max_d
+        else:
+            dx = rng.randint(min_d, max_d)
+            dy = rng.randint(min_d, max_d)
         x, y = sample_operand(dx, rng), sample_operand(dy, rng)
         t, a, m = build_example(x, y, max_len)
         T.append(t); A.append(a); M.append(m)
@@ -136,11 +146,17 @@ class AbacusDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def exact_match_at_length(model, n_digits, n, max_len, abacus_max, rng, device) -> float:
+def exact_match_at_length(model, n_digits, n, max_len, abacus_max, rng, device,
+                          pure=False) -> float:
+    """pure=True forces BOTH operands to exactly n_digits (the hard corner); else
+    operand lengths are uniform in [1, n_digits]."""
     model.eval()
     correct = 0
     for _ in range(n):
-        dx = rng.randint(1, n_digits); dy = rng.randint(1, n_digits)
+        if pure:
+            dx = dy = n_digits
+        else:
+            dx = rng.randint(1, n_digits); dy = rng.randint(1, n_digits)
         x, y = sample_operand(dx, rng), sample_operand(dy, rng)
         target = digits_lsb(x * y)
         xr, yr = digits_lsb(x), digits_lsb(y)
@@ -166,6 +182,8 @@ def exact_match_at_length(model, n_digits, n, max_len, abacus_max, rng, device) 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-digits", type=int, default=5, help="max operand digits in training")
+    ap.add_argument("--hard-frac", type=float, default=0.0,
+                    help="fraction of batch forced to max_d x max_d (drills the length cliff)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -243,7 +261,8 @@ def main() -> int:
 
     for step in range(start_step + 1, args.steps + 1):
         model.train()
-        toks, abac, mask = make_batch(args.batch, 1, maxd, max_len, rng, device)
+        toks, abac, mask = make_batch(args.batch, 1, maxd, max_len, rng, device,
+                                      hard_frac=args.hard_frac)
         with amp_ctx:
             logits = model(toks, abac)          # (B, T, V)
             # predict token t+1 from t; supervise product region + EOS only
@@ -260,12 +279,15 @@ def main() -> int:
             # exact-match in-distribution (=maxd) and one digit longer (extrapolation)
             acc = {d: exact_match_at_length(model, d, args.eval_n, max_len, abacus_max, eval_rng, device)
                    for d in (maxd, maxd + 1)}
+            pure = exact_match_at_length(model, maxd, args.eval_n, max_len, abacus_max,
+                                         eval_rng, device, pure=True)
             print(f"step {step:6d} | loss {loss.item():.4f} | "
-                  f"exact@{maxd}d {acc[maxd]:.3f} | exact@{maxd+1}d(extrap) {acc[maxd+1]:.3f} | "
+                  f"exact@{maxd}d {acc[maxd]:.3f} | pure{maxd}x{maxd} {pure:.3f} | "
+                  f"exact@{maxd+1}d(extrap) {acc[maxd+1]:.3f} | "
                   f"{time.monotonic()-start:.0f}s")
             save_ckpt(args.ckpt, step, best)
-            if args.ckpt and acc[maxd] > best:
-                best = acc[maxd]
+            if args.ckpt and pure > best:          # track the hard corner, not the average
+                best = pure
                 save_ckpt(args.ckpt.replace(".pt", "_best.pt"), step, best)
 
     save_ckpt(args.ckpt, args.steps, best)
