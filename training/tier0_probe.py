@@ -23,6 +23,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import random
 import time
 
@@ -167,9 +169,19 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--warmup", type=int, default=2000,
+                    help="linear LR warmup steps (stabilizes deep models)")
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="max grad norm; <=0 disables")
     ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--eval-n", type=int, default=400)
+    ap.add_argument("--amp", action="store_true",
+                    help="bf16 autocast on CUDA (~1.5-2x faster on Ada/Ampere)")
+    ap.add_argument("--ckpt", type=str, default="training/checkpoints/tier0.pt")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume model/opt/sched/step from --ckpt if it exists")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -187,29 +199,76 @@ def main() -> int:
     print(f"device {device} | max_digits {maxd} | params {n_params:,}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps, eta_min=args.lr * 0.1)
+    warmup = max(0, min(args.warmup, args.steps - 1))
+    if warmup > 0:
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=0.01, end_factor=1.0, total_iters=warmup),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=args.steps - warmup, eta_min=args.lr * 0.1),
+            ],
+            milestones=[warmup])
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=args.steps, eta_min=args.lr * 0.1)
     loss_fn = nn.CrossEntropyLoss()
+
+    cfg = dict(d_model=args.d_model, layers=args.layers, max_len=max_len,
+               abacus_max=abacus_max, max_digits=maxd)
+
+    def save_ckpt(path, step, best):
+        if not args.ckpt:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(dict(model=model.state_dict(), opt=opt.state_dict(),
+                        sched=sched.state_dict(), step=step, best=best,
+                        config=cfg, args=vars(args)), path)
+
+    start_step, best = 0, -1.0
+    if args.resume and args.ckpt and os.path.exists(args.ckpt):
+        ck = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        start_step, best = ck["step"], ck.get("best", -1.0)
+        print(f"resumed from {args.ckpt} at step {start_step} (best {best:.3f})")
+
+    use_amp = args.amp and device.type == "cuda"
+    amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if use_amp else contextlib.nullcontext())
+    if use_amp:
+        print("bf16 autocast ON")
     start = time.monotonic()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         model.train()
         toks, abac, mask = make_batch(args.batch, 1, maxd, max_len, rng, device)
-        logits = model(toks, abac)              # (B, T, V)
-        # predict token t+1 from t; supervise product region + EOS only
-        logits = logits[:, :-1].reshape(-1, VOCAB)
-        target = toks[:, 1:].reshape(-1)
-        m = mask[:, 1:].reshape(-1)
-        loss = loss_fn(logits[m], target[m])
-        opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+        with amp_ctx:
+            logits = model(toks, abac)          # (B, T, V)
+            # predict token t+1 from t; supervise product region + EOS only
+            logits = logits[:, :-1].reshape(-1, VOCAB)
+            target = toks[:, 1:].reshape(-1)
+            m = mask[:, 1:].reshape(-1)
+            loss = loss_fn(logits[m], target[m])
+        opt.zero_grad(); loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        opt.step(); sched.step()
 
         if step % args.eval_every == 0:
             # exact-match in-distribution (=maxd) and one digit longer (extrapolation)
-            acc = {d: exact_match_at_length(model, d, 400, max_len, abacus_max, eval_rng, device)
+            acc = {d: exact_match_at_length(model, d, args.eval_n, max_len, abacus_max, eval_rng, device)
                    for d in (maxd, maxd + 1)}
             print(f"step {step:6d} | loss {loss.item():.4f} | "
                   f"exact@{maxd}d {acc[maxd]:.3f} | exact@{maxd+1}d(extrap) {acc[maxd+1]:.3f} | "
                   f"{time.monotonic()-start:.0f}s")
+            save_ckpt(args.ckpt, step, best)
+            if args.ckpt and acc[maxd] > best:
+                best = acc[maxd]
+                save_ckpt(args.ckpt.replace(".pt", "_best.pt"), step, best)
 
+    save_ckpt(args.ckpt, args.steps, best)
     print("done.")
     return 0
 
