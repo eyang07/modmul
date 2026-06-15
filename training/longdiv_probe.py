@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import os
 import random
 import time
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -169,36 +171,76 @@ class AbacusDecoder(nn.Module):
 
 @torch.no_grad()
 def eval_remainder(model, primes, n, max_len, abacus_max, rng, device):
-    """Returns final-remainder exact-match over n freshly sampled products."""
+    """Final-remainder exact-match over n products, batched by prompt length.
+
+    Same distribution and metric as a per-sample greedy decode, but all samples
+    sharing a prompt length are decoded together (one batched forward per step
+    instead of one per sample) -> ~batch-size speedup. No KV cache, so each step
+    still recomputes the full sequence, but amortised across the whole group.
+    """
     model.eval()
-    ok = 0
+    specials_t = torch.tensor(sorted(SPECIALS), device=device)
+
+    # Build every prompt, then group identical-length prompts so they stack cleanly.
+    samples, groups = [], defaultdict(list)
     for _ in range(n):
         p = primes[rng.randrange(len(primes))]
         a, b = rng.randrange(p), rng.randrange(p)
         N = a * b
-        true_rem = N % p
-        toks = [BOS] + digits_msb(N) + [MOD] + digits_msb(p) + [EQ]
-        abac = ([0] + list(range(len(digits_msb(N)))) + [0]
-                + list(range(len(digits_msb(p)))) + [0])
-        gen, seg = [], 0
-        while len(toks) < max_len:
-            tt = torch.tensor([toks], dtype=torch.long, device=device)
-            aa = torch.tensor([abac], dtype=torch.long, device=device)
-            nxt = int(model(tt, aa)[0, -1].argmax())
-            if nxt == EOS:
-                break
-            toks.append(nxt); gen.append(nxt)
-            if nxt in SPECIALS:
-                abac.append(0); seg = 0
-            else:
-                abac.append(min(seg, abacus_max - 1)); seg += 1
-        # Final remainder = digits after the LAST colon.
-        if COLON in gen:
-            j = len(gen) - 1 - gen[::-1].index(COLON)
-            ans = [d for d in gen[j + 1:] if d < 10]
-            if ans and msb_to_int(ans) == true_rem:
-                ok += 1
+        Nd, pd = digits_msb(N), digits_msb(p)
+        toks = [BOS] + Nd + [MOD] + pd + [EQ]
+        abac = [0] + list(range(len(Nd))) + [0] + list(range(len(pd))) + [0]
+        groups[len(toks)].append(len(samples))
+        samples.append((toks, abac, N % p))
+
+    ok = 0
+    for L, idxs in groups.items():
+        g = len(idxs)
+        toks = torch.tensor([samples[i][0] for i in idxs], dtype=torch.long, device=device)
+        abac = torch.tensor([samples[i][1] for i in idxs], dtype=torch.long, device=device)
+        seg = torch.zeros(g, dtype=torch.long, device=device)
+        done = torch.zeros(g, dtype=torch.bool, device=device)
+        gen = [[] for _ in range(g)]
+        while toks.shape[1] < max_len and not bool(done.all()):
+            nxt = model(toks, abac)[:, -1].argmax(-1)            # [g]
+            nxt = torch.where(done, torch.full_like(nxt, PAD), nxt)
+            is_special = (nxt.unsqueeze(1) == specials_t).any(1)
+            new_abac = torch.where(is_special, torch.zeros_like(seg),
+                                   torch.clamp(seg, max=abacus_max - 1))
+            seg = torch.where(is_special, torch.zeros_like(seg), seg + 1)
+            nxt_cpu, done_cpu = nxt.tolist(), done.tolist()
+            for j in range(g):
+                if not done_cpu[j] and nxt_cpu[j] != EOS and nxt_cpu[j] != PAD:
+                    gen[j].append(nxt_cpu[j])
+            toks = torch.cat([toks, nxt.unsqueeze(1)], dim=1)
+            abac = torch.cat([abac, new_abac.unsqueeze(1)], dim=1)
+            done = done | (nxt == EOS)
+        for j, i in enumerate(idxs):
+            gj = gen[j]
+            if COLON in gj:
+                k = len(gj) - 1 - gj[::-1].index(COLON)
+                ans = [d for d in gj[k + 1:] if d < 10]
+                if ans and msb_to_int(ans) == samples[i][2]:
+                    ok += 1
     return ok / n
+
+
+@torch.no_grad()
+def eval_teacher_forced(model, primes, n, max_len, rng, device):
+    """Cheap smooth signal during warmup: one batched teacher-forced forward.
+
+    Returns (token_acc, seq_acc) over the supervised scratchpad positions. seq_acc
+    = fraction of examples with EVERY output token correct (an optimistic upper
+    bound on the autoregressive metric, but it moves early instead of sitting at 0).
+    """
+    model.eval()
+    toks, abac, mask = make_batch(n, primes, max_len, rng, device)
+    pred = model(toks, abac)[:, :-1].argmax(-1)
+    target, m = toks[:, 1:], mask[:, 1:]
+    hit = (pred == target) & m
+    tok_acc = hit.sum().item() / max(1, m.sum().item())
+    seq_acc = ((hit == m).all(dim=1)).float().mean().item()  # all masked positions hit
+    return tok_acc, seq_acc
 
 
 def main() -> int:
@@ -219,6 +261,10 @@ def main() -> int:
                     help="ramp the prime ceiling small->large over --curr-frac of training")
     ap.add_argument("--curr-frac", type=float, default=0.6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ckpt", type=str, default="training/checkpoints/longdiv.pt",
+                    help="path to save training state (latest) + a _best.pt copy; '' disables")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume model/opt/sched/step from --ckpt if it exists")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -264,9 +310,30 @@ def main() -> int:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps, eta_min=args.lr * 0.1)
     loss_fn = nn.CrossEntropyLoss()
+
+    cfg = dict(d_model=args.d_model, layers=args.layers, nhead=args.nhead,
+               dim_ff=args.dim_ff, max_len=max_len, abacus_max=abacus_max,
+               p_min=args.p_min, p_max=args.p_max)
+
+    def save_ckpt(path, step, best):
+        if not args.ckpt:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(dict(model=model.state_dict(), opt=opt.state_dict(),
+                        sched=sched.state_dict(), step=step, best=best,
+                        config=cfg, args=vars(args)), path)
+
+    start_step, best = 0, -1.0
+    if args.resume and args.ckpt and os.path.exists(args.ckpt):
+        ck = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        start_step, best = ck["step"], ck.get("best", -1.0)
+        print(f"resumed from {args.ckpt} at step {start_step} (best {best:.3f})")
+
     start = time.monotonic()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step + 1, args.steps + 1):
         model.train()
         hi = bisect.bisect_left(POOL, cur_pmax(step))
         primes_now = POOL[:hi] if hi > 0 else POOL[:1]
@@ -279,14 +346,24 @@ def main() -> int:
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
 
         if step % args.eval_every == 0:
-            parts = []
+            parts, rems = [], []
             for lo, hi, ps in buckets:
                 rem = eval_remainder(model, ps, args.eval_n, max_len,
                                      abacus_max, eval_rng, device)
+                rems.append(rem)
                 parts.append(f"[{lo}-{hi}) rem {rem:.3f}")
+            tf_tok, tf_seq = eval_teacher_forced(model, POOL, args.eval_n, max_len,
+                                                 eval_rng, device)
             print(f"step {step:6d} | loss {loss.item():.4f} | " + " | ".join(parts)
+                  + f" | tf_tok {tf_tok:.3f} tf_seq {tf_seq:.3f}"
                   + f" | cur_pmax {cur_pmax(step)} | {time.monotonic()-start:.0f}s")
+            save_ckpt(args.ckpt, step, best)                       # latest (for resume)
+            score = rems[-1] if rems else 0.0                      # hardest bucket
+            if args.ckpt and score > best:
+                best = score
+                save_ckpt(args.ckpt.replace(".pt", "_best.pt"), step, best)
 
+    save_ckpt(args.ckpt, args.steps, best)
     print("done.")
     return 0
 
