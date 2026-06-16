@@ -50,6 +50,7 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=500)
     ap.add_argument("--p-min", type=int, default=512)
     ap.add_argument("--p-max", type=int, default=65536)
+    ap.add_argument("--pool-size", type=int, default=40000)
     ap.add_argument("--seed", type=int, default=999)
     args = ap.parse_args()
 
@@ -62,7 +63,8 @@ def main() -> int:
     model.load_state_dict(ck["model"]); model.eval()
     print(f"loaded {args.ckpt} | step {ck.get('step')} | best {ck.get('best')}")
 
-    POOL = [p for p in primes_for_tier(3) if args.p_min <= p < args.p_max]
+    POOL = M.build_prime_pool(args.p_min, args.p_max, args.pool_size,
+                              random.Random(args.seed + 12345))
     rng = random.Random(args.seed)
     toks, abac, mask = M.make_batch(args.n, POOL, c["max_len"], rng, device)
     with torch.no_grad():

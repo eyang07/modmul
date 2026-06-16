@@ -73,6 +73,57 @@ def msb_to_int(ds: list[int]) -> int:
     return v
 
 
+# ---------------------------------------------------------------------------
+# Prime pool: tiers 1-3 are enumerable (sieve); tier 4 [2^17, 2^32) is not
+# (~2e8 primes), so sample a pool with Miller-Rabin. Log-uniform sampling gives
+# the model a spread of chain lengths (6..10-digit primes) rather than ~all max.
+# ---------------------------------------------------------------------------
+SIEVE_LIMIT = 65536
+
+
+def _is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    for sp in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % sp == 0:
+            return n == sp
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d //= 2; r += 1
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):  # deterministic < 3.3e24
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def build_prime_pool(p_min: int, p_max: int, size: int, rng: random.Random) -> list[int]:
+    """Sorted prime pool over [p_min, p_max). Sieve for the enumerable range;
+    log-uniform Miller-Rabin sampling for tier 4 and beyond."""
+    if p_max <= SIEVE_LIMIT:
+        return sorted(p for p in primes_for_tier(3) if p_min <= p < p_max)
+    import math
+    lo_log, hi_log = math.log(p_min), math.log(p_max)
+    out: set[int] = set()
+    while len(out) < size:
+        n = int(math.exp(rng.uniform(lo_log, hi_log))) | 1
+        if n < p_min or n >= p_max:
+            continue
+        while not _is_prime(n):
+            n += 2
+            if n >= p_max:
+                break
+        else:
+            out.add(n)
+    return sorted(out)
+
+
 def modmul_rows(x: int, y: int, p: int):
     """The per-y-digit (d, q1, r1, pp, t, q2, r2) chain; final r2 == (x*y) % p.
 
@@ -268,6 +319,8 @@ def main() -> int:
     ap.add_argument("--eval-n", type=int, default=300)
     ap.add_argument("--p-min", type=int, default=512)
     ap.add_argument("--p-max", type=int, default=65536, help="full tier-3 is [512, 65536)")
+    ap.add_argument("--pool-size", type=int, default=40000,
+                    help="sampled prime-pool size for non-enumerable ranges (tier 4)")
     ap.add_argument("--curriculum", action="store_true",
                     help="ramp the prime ceiling small->large over --curr-frac of training")
     ap.add_argument("--curr-frac", type=float, default=0.6)
@@ -283,7 +336,8 @@ def main() -> int:
     rng = random.Random(args.seed)
     eval_rng = random.Random(999)
 
-    POOL = [p for p in primes_for_tier(3) if args.p_min <= p < args.p_max]
+    pool_rng = random.Random(args.seed + 12345)
+    POOL = build_prime_pool(args.p_min, args.p_max, args.pool_size, pool_rng)
     if not POOL:
         raise SystemExit(f"no primes in [{args.p_min}, {args.p_max})")
 
@@ -305,7 +359,10 @@ def main() -> int:
         frac = min(1.0, step / max(1, args.curr_frac * args.steps))
         return int(curr_start * (args.p_max / curr_start) ** frac)
 
-    edges = [(512, 2048), (2048, 8192), (8192, 65536)]
+    if args.p_max <= SIEVE_LIMIT:
+        edges = [(512, 2048), (2048, 8192), (8192, 65536)]
+    else:                                    # tier-4 log-spaced buckets, hardest last
+        edges = [(2**17, 2**22), (2**22, 2**27), (2**27, 2**32)]
     buckets = []
     for lo, hi in edges:
         lo2, hi2 = max(lo, args.p_min), min(hi, args.p_max)
