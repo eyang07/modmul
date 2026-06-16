@@ -20,7 +20,7 @@ import torch
 import modmul_probe as M
 from data import primes_for_tier
 
-FIELDS = {0: "d", 1: "q1", 2: "r1", 3: "pp", 4: "t", 5: "q2", 6: "r2"}
+FIELDS = {0: "d", 1: "q1", 2: "m1", 3: "r1", 4: "pp", 5: "t", 6: "q2", 7: "m2", 8: "r2"}
 
 
 def field_ids(toks: list[int]) -> list[int]:

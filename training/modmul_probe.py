@@ -134,11 +134,11 @@ def modmul_rows(x: int, y: int, p: int):
     result, rows = 0, []
     for d in digits_msb(y):
         s = result * 10
-        q1 = s // p; r1 = s - q1 * p          # shift-reduce, q1 in 0..9
-        pp = x * d                            # single-digit multiply
-        t = r1 + pp                           # explicit add (supervised)
-        q2 = t // p; r2 = t - q2 * p          # add-reduce, q2 in 0..9
-        rows.append((d, q1, r1, pp, t, q2, r2))
+        q1 = s // p; m1 = q1 * p; r1 = s - m1   # shift-reduce: q*p explicit, then subtract
+        pp = x * d                              # single-digit multiply
+        t = r1 + pp                             # explicit add (supervised)
+        q2 = t // p; m2 = q2 * p; r2 = t - m2   # add-reduce: q*p explicit, then subtract
+        rows.append((d, q1, m1, r1, pp, t, q2, m2, r2))
         result = r2
     return rows
 
@@ -175,15 +175,17 @@ def build_example(x: int, y: int, p: int, max_len: int):
     def emit_digit(v):          # single 0..9 value
         emit(v, 0)
 
-    for i, (d, q1, r1, pp, t, q2, r2) in enumerate(modmul_rows(x, y, p)):
+    for i, (d, q1, m1, r1, pp, t, q2, m2, r2) in enumerate(modmul_rows(x, y, p)):
         if i > 0:
             emit(STEP, 0)
         emit_digit(d)
         emit(COLON, 0); emit_digit(q1)
+        emit(COLON, 0); emit_num(m1)
         emit(COLON, 0); emit_num(r1)
         emit(COLON, 0); emit_num(pp)
         emit(COLON, 0); emit_num(t)
         emit(COLON, 0); emit_digit(q2)
+        emit(COLON, 0); emit_num(m2)
         emit(COLON, 0); emit_num(r2)
     emit(EOS, 0)
 
@@ -343,11 +345,16 @@ def main() -> int:
 
     # Sequence sizing: y up to pd digits -> pd blocks; pp = x*d < 9*p_max; t < 10*p_max.
     pd = len(str(args.p_max - 1))                 # digits in a prime / operand / remainder
-    ppd = len(str(9 * (args.p_max - 1)))          # max digits in a partial product pp
+    ppd = len(str(9 * (args.p_max - 1)))          # max digits in q*p or pp = x*d (< 9p)
     td = len(str(10 * (args.p_max - 1)))          # max digits in t = r1 + pp (< 10p)
     abacus_max = max(ppd, td, pd) + 2
-    # per block: d : q1 : r1 : pp : t : q2 : r2  (+ STEP); d,q1,q2 are single digits
-    block = 1 + 1 + 1 + 1 + pd + 1 + ppd + 1 + td + 1 + 1 + 1 + pd + 1
+    # per block: d : q1 : m1 : r1 : pp : t : q2 : m2 : r2  (+ STEP)
+    #   single digits d,q1,q2 ; wide m1,pp,m2 (ppd) ; r1,r2 (pd) ; t (td) ; 8 colons + STEP
+    block = (1 + 1 + 1            # d, q1, q2
+             + 3 * ppd            # m1, pp, m2
+             + 2 * pd             # r1, r2
+             + td                 # t
+             + 8 + 1)             # colons + STEP
     header = 1 + pd + 1 + pd + 1 + pd + 1         # BOS x MUL y MOD p EQ
     max_len = header + pd * block + 1 + 8         # EOS + slack
 
