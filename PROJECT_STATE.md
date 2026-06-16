@@ -40,7 +40,7 @@ parameters**, not hand-coded math.
 |---|---|---|
 | 1 | ✅ trivial | fixed small primes {2,3,5,7} — 1.00 |
 | **2** | ✅ **BANKED + SUBMITTED** | `cire77/ebm-modmul @15211043` — 1.00 |
-| **3** | ✅ **SOLVED LOCALLY (htop90=3)** | interleaved modmul scratchpad — official local scorer **0.99**; not yet uploaded to HF |
+| **3** | ✅ **SOLVED + SUBMITTED (htop90=3)** | `cire77/modmul-tier3 @ec9691c0` — public-pipeline `evaluate-hf` reproduces htop90=3 (tier3 1.00) |
 | 4 | ⚪ stretch, one cheap data-driven swing later | frontier coin-flip |
 | 5–10 | ⚪ out of scope | open / unsolved-ML territory |
 
@@ -51,10 +51,16 @@ parameters**, not hand-coded math.
 > [0]. Static compliance check passed, deterministic. The single `modmul_best.pt` scratchpad
 > (step 74k, full tier-3 range) computes (a·b) mod p end-to-end; large-N held-out eval ~0.98.
 > Integrated into `submission/ebm_modmul/model.py` (routed by prime: <512 → cls head, 512–65535
-> → modmul, ≥65536 → [0]). **Remaining: upload the bundled weights.pt to HuggingFace and submit.**
-> The winning recipe: scratchpad with EVERY intermediate supervised — one-shot 5-digit multiply
-> was a hard wall; the decisive fix was emitting the addition t=r1+pp explicitly (see
-> `training/modmul_probe.py`, `memory/tier3-compose-findings.md`).
+> → modmul, ≥65536 → [0]). The winning recipe: scratchpad with EVERY intermediate supervised —
+> one-shot 5-digit multiply was a hard wall; the decisive fix was emitting the addition t=r1+pp
+> explicitly (see `training/modmul_probe.py`, `memory/tier3-compose-findings.md`).
+>
+> **SUBMITTED 2026-06-16.** Uploaded the 3 files to HuggingFace `cire77/modmul-tier3`, commit
+> **`ec9691c0a7371c5ced9bf3b6b0a58b544978587f`** (public repo). The organizers' exact pipeline
+> (`modchallenge evaluate-hf`) downloaded the repo fresh and reproduced **htop90=3**: tier1 1.00,
+> tier2 0.99, tier3 1.00, tiers4+ honest [0], static check passed, deterministic. Robustness
+> confirmed by a 30-seed local sweep (htop90==3 on all 30; tier3 min 0.95 / mean 0.986).
+> repo_id + commit submitted to the organizers.
 
 ---
 
