@@ -38,13 +38,23 @@ parameters**, not hand-coded math.
 
 | Tier | Status | Notes |
 |---|---|---|
-| 1 | ✅ trivial | fixed small primes {2,3,5,7} |
-| **2** | ✅ **BANKED + SUBMITTED** | `cire77/ebm-modmul @15211043` — htop90=2 is locked |
-| **3** | 🟢 **both halves proven, compose next** | see below — this is the live push |
+| 1 | ✅ trivial | fixed small primes {2,3,5,7} — 1.00 |
+| **2** | ✅ **BANKED + SUBMITTED** | `cire77/ebm-modmul @15211043` — 1.00 |
+| **3** | ✅ **SOLVED LOCALLY (htop90=3)** | interleaved modmul scratchpad — official local scorer **0.99**; not yet uploaded to HF |
 | 4 | ⚪ stretch, one cheap data-driven swing later | frontier coin-flip |
 | 5–10 | ⚪ out of scope | open / unsolved-ML territory |
 
 **Baselines on the leaderboard sit at htop90=1.** Breaking tier 3 is a genuine result.
+
+> **2026-06-16 — TIER 3 CRACKED.** `modchallenge evaluate` (seed abcd1234, 1100 problems)
+> returns **highest_tier_above_90 = 3**: tier1 1.00, tier2 1.00, **tier3 0.99**, tiers 4+ honest
+> [0]. Static compliance check passed, deterministic. The single `modmul_best.pt` scratchpad
+> (step 74k, full tier-3 range) computes (a·b) mod p end-to-end; large-N held-out eval ~0.98.
+> Integrated into `submission/ebm_modmul/model.py` (routed by prime: <512 → cls head, 512–65535
+> → modmul, ≥65536 → [0]). **Remaining: upload the bundled weights.pt to HuggingFace and submit.**
+> The winning recipe: scratchpad with EVERY intermediate supervised — one-shot 5-digit multiply
+> was a hard wall; the decisive fix was emitting the addition t=r1+pp explicitly (see
+> `training/modmul_probe.py`, `memory/tier3-compose-findings.md`).
 
 ---
 

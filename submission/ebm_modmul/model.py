@@ -20,6 +20,7 @@ checkpoint's ``arch`` field, so the same wrapper serves either trained head.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -198,6 +199,114 @@ def _angular_decode(pred: torch.Tensor, p_int: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Tier-3 interleaved modular-multiply scratchpad (autoregressive).
+#
+# Self-contained copy of the trained training/modmul_probe.py decoder + greedy
+# decode. The network emits the schoolbook computation digit by digit:
+#   BOS x MUL y MOD p EQ  d:q1:r1:pp:t:q2:r2 STEP ... EOS
+# folding multiply and reduction into one Horner pass so no intermediate exceeds
+# ~6 digits. Compliance: the only modular reduction in shipped code is the
+# per-operand int(a)%p / int(b)%p done BEFORE the network runs; the product's
+# reduction is produced entirely by trained parameters (greedy argmax over digit
+# tokens). There is no %, //, Barrett, Montgomery or CRT applied to a*b anywhere.
+# ---------------------------------------------------------------------------
+
+MM_PAD, MM_BOS, MM_MUL, MM_MOD, MM_EQ, MM_COLON, MM_STEP, MM_EOS = 10, 11, 12, 13, 14, 15, 16, 17
+MM_VOCAB = 18
+MM_SPECIALS = {MM_PAD, MM_BOS, MM_MUL, MM_MOD, MM_EQ, MM_COLON, MM_STEP, MM_EOS}
+
+
+def _digits_msb(n: int) -> list[int]:
+    if n == 0:
+        return [0]
+    s = []
+    while n > 0:
+        s.append(n % 10)
+        n //= 10
+    return s[::-1]
+
+
+class AbacusDecoder(nn.Module):
+    """Decoder-only transformer with abacus (place-within-number) embeddings.
+    Architecture identical to training/modmul_probe.py for state_dict match."""
+
+    def __init__(self, max_len, abacus_max, d_model=384, nhead=8, num_layers=8, dim_ff=1536):
+        super().__init__()
+        self.tok_emb = nn.Embedding(MM_VOCAB, d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+        self.abacus_emb = nn.Embedding(abacus_max, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=0.0, batch_first=True, activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, MM_VOCAB, bias=False)
+        self.max_len = max_len
+        self.register_buffer("pos_ids", torch.arange(max_len), persistent=False)
+
+    def forward(self, toks, abacus):
+        b, t = toks.shape
+        x = self.tok_emb(toks) + self.pos_emb(self.pos_ids[:t]) + self.abacus_emb(abacus)
+        mask = torch.triu(torch.full((t, t), float("-inf"), device=toks.device), diagonal=1)
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return self.head(self.ln(x))
+
+
+@torch.no_grad()
+def _modmul_decode(model, cfg, xyp, device, chunk=128):
+    """Greedy-decode (x*y) mod p for each (x, y, p) with x,y already in [0, p).
+    Returns a list of residue digit-lists (MSB-first), or [0] if unparseable.
+    Decodes in length-grouped chunks to bound memory."""
+    max_len, abmax = cfg["max_len"], cfg["abacus_max"]
+    specials = torch.tensor(sorted(MM_SPECIALS), device=device)
+    out: list[list[int] | None] = [None] * len(xyp)
+
+    groups = defaultdict(list)
+    prompts = []
+    for i, (x, y, p) in enumerate(xyp):
+        xd, yd, pd = _digits_msb(x), _digits_msb(y), _digits_msb(p)
+        toks = [MM_BOS] + xd + [MM_MUL] + yd + [MM_MOD] + pd + [MM_EQ]
+        abac = ([0] + list(range(len(xd))) + [0] + list(range(len(yd)))
+                + [0] + list(range(len(pd))) + [0])
+        groups[len(toks)].append(i)
+        prompts.append((toks, abac))
+
+    for L, idxs in groups.items():
+        for s in range(0, len(idxs), chunk):
+            sub = idxs[s:s + chunk]
+            g = len(sub)
+            toks = torch.tensor([prompts[i][0] for i in sub], dtype=torch.long, device=device)
+            abac = torch.tensor([prompts[i][1] for i in sub], dtype=torch.long, device=device)
+            seg = torch.zeros(g, dtype=torch.long, device=device)
+            done = torch.zeros(g, dtype=torch.bool, device=device)
+            gen = [[] for _ in range(g)]
+            while toks.shape[1] < max_len and not bool(done.all()):
+                nxt = model(toks, abac)[:, -1].argmax(-1)
+                nxt = torch.where(done, torch.full_like(nxt, MM_PAD), nxt)
+                is_sp = (nxt.unsqueeze(1) == specials).any(1)
+                new_abac = torch.where(is_sp, torch.zeros_like(seg),
+                                       torch.clamp(seg, max=abmax - 1))
+                seg = torch.where(is_sp, torch.zeros_like(seg), seg + 1)
+                nc, dc = nxt.tolist(), done.tolist()
+                for j in range(g):
+                    if not dc[j] and nc[j] != MM_EOS and nc[j] != MM_PAD:
+                        gen[j].append(nc[j])
+                toks = torch.cat([toks, nxt.unsqueeze(1)], dim=1)
+                abac = torch.cat([abac, new_abac.unsqueeze(1)], dim=1)
+                done = done | (nxt == MM_EOS)
+            for j, i in enumerate(sub):
+                gj = gen[j]
+                if MM_COLON in gj:
+                    k = len(gj) - 1 - gj[::-1].index(MM_COLON)
+                    ans = [d for d in gj[k + 1:] if d < 10]
+                    out[i] = ans if ans else [0]
+                else:
+                    out[i] = [0]
+    return [o if o is not None else [0] for o in out]
+
+
+# ---------------------------------------------------------------------------
 # Submission entry class
 # ---------------------------------------------------------------------------
 
@@ -206,6 +315,8 @@ class EBMModMul(ModularMultiplicationModel):
         self.model = None
         self.device = None
         self.arch = None
+        self.mm = None          # tier-3 modmul scratchpad
+        self.mm_cfg = None
 
     def load(self, model_dir: str) -> None:
         if torch.cuda.is_available():
@@ -217,10 +328,21 @@ class EBMModMul(ModularMultiplicationModel):
 
         ckpt = torch.load(Path(model_dir) / "weights.pt",
                           map_location=self.device, weights_only=False)
+        # Tiers 1-2: the classification/angular head (banked).
         self.arch = ckpt.get("arch", "cls")
         self.model = _ARCHS[self.arch](**ckpt["config"]).to(self.device)
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.eval()
+        # Tier 3: the interleaved modular-multiply scratchpad (optional bundle).
+        if "tier3" in ckpt:
+            c = ckpt["tier3"]["config"]
+            self.mm_cfg = c
+            self.mm = AbacusDecoder(
+                max_len=c["max_len"], abacus_max=c["abacus_max"], d_model=c["d_model"],
+                nhead=c["nhead"], num_layers=c["layers"], dim_ff=c["dim_ff"],
+            ).to(self.device)
+            self.mm.load_state_dict(ckpt["tier3"]["state_dict"])
+            self.mm.eval()
 
     # Per-argument identity preprocessing (each hook sees only its own argument).
     def preprocess_a(self, a): return a
@@ -231,24 +353,34 @@ class EBMModMul(ModularMultiplicationModel):
     def predict_digits(self, a_enc, b_enc, p_enc):
         return self.predict_digits_batch([(a_enc, b_enc, p_enc)])[0]
 
+    # Prime routing: tiers 1-2 (p < 512) use the classification head; tier 3
+    # (512 <= p < 65536) uses the modmul scratchpad; p >= 65536 (tiers 4+) is out
+    # of regime. 512 = 2**9 is exactly the tier-3 floor (see config TIERS).
+    TIER3_LO = 512
+    TIER3_HI = 65536
+
     @torch.no_grad()
     def predict_digits_batch(self, inputs):
         out: list[list[int] | None] = [None] * len(inputs)
-        x_rows, y_rows, p_rows, p_ints, idx = [], [], [], [], []
+        x_rows, y_rows, p_rows, p_ints, idx = [], [], [], [], []   # tiers 1-2
+        mm_items, mm_idx = [], []                                  # tier 3
 
         for i, (a_enc, b_enc, p_enc) in enumerate(inputs):
             p = int(p_enc)
-            # Out of the model's regime (residues don't fit WIDTH digits): honest 0.
-            if p >= 10 ** WIDTH:
+            # Out of regime (residues don't fit the fixed-width / trained range): honest 0.
+            if p >= self.TIER3_HI:
                 out[i] = [0]
                 continue
             a_red = int(a_enc) % p          # per-operand reduction (allowed)
             b_red = int(b_enc) % p
-            x_rows.append(digits_fixed(a_red))
-            y_rows.append(digits_fixed(b_red))
-            p_rows.append(digits_fixed(p))
-            p_ints.append(p)
-            idx.append(i)
+            if p >= self.TIER3_LO and self.mm is not None:
+                mm_items.append((a_red, b_red, p)); mm_idx.append(i)
+            else:
+                x_rows.append(digits_fixed(a_red))
+                y_rows.append(digits_fixed(b_red))
+                p_rows.append(digits_fixed(p))
+                p_ints.append(p)
+                idx.append(i)
 
         if idx:
             t = lambda r: torch.tensor(r, dtype=torch.long, device=self.device)
@@ -259,6 +391,11 @@ class EBMModMul(ModularMultiplicationModel):
                 residues = logits.argmax(dim=-1).tolist()
             for j, i in enumerate(idx):
                 out[i] = int_to_decimal_digits(int(residues[j]))
+
+        if mm_items:
+            res = _modmul_decode(self.mm, self.mm_cfg, mm_items, self.device)
+            for j, i in enumerate(mm_idx):
+                out[i] = res[j]
 
         return [o if o is not None else [0] for o in out]
 
