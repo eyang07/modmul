@@ -9,9 +9,11 @@ Compliance contract (see rules/evaluation.md):
   ``[0, p)``) materially determines the answer.
 - We emit the residue as base-10 digits (``output_base = 10``); the harness decodes.
 
-Out of regime (``p >= 10**WIDTH``, i.e. tiers >= 4) the network's fixed-width
-residue encoding cannot represent the operands, so we emit ``[0]`` — an honest
-fallback, not a guess. This model targets the low tiers (1-3).
+Routing by prime size: tiers 1-2 (p < 512) use the classification head; tier 3
+(512 <= p < 65536) and tier 4 (65536 <= p < 2**32) use the interleaved
+modular-multiply scratchpad decoder (same architecture, separately trained
+weights). p >= 2**32 (tiers 5+) is out of regime, so we emit ``[0]`` — an honest
+fallback, not a guess.
 
 The architecture (encoder + classification/angular head) is loaded from the
 checkpoint's ``arch`` field, so the same wrapper serves either trained head.
@@ -281,6 +283,7 @@ def _modmul_decode(model, cfg, xyp, device, chunk=128):
             seg = torch.zeros(g, dtype=torch.long, device=device)
             done = torch.zeros(g, dtype=torch.bool, device=device)
             gen = [[] for _ in range(g)]
+            steps = 0
             while toks.shape[1] < max_len and not bool(done.all()):
                 nxt = model(toks, abac)[:, -1].argmax(-1)
                 nxt = torch.where(done, torch.full_like(nxt, MM_PAD), nxt)
@@ -295,6 +298,15 @@ def _modmul_decode(model, cfg, xyp, device, chunk=128):
                 toks = torch.cat([toks, nxt.unsqueeze(1)], dim=1)
                 abac = torch.cat([abac, new_abac.unsqueeze(1)], dim=1)
                 done = done | (nxt == MM_EOS)
+                # The sequence grows one token per step, so the caching allocator
+                # holds a distinct buffer for every length (~800 on tier-4 chains)
+                # and OOMs mid-decode. Periodically release them.
+                steps += 1
+                if steps % 32 == 0:
+                    if device.type == "mps":
+                        torch.mps.empty_cache()
+                    elif device.type == "cuda":
+                        torch.cuda.empty_cache()
             for j, i in enumerate(sub):
                 gj = gen[j]
                 if MM_COLON in gj:
@@ -303,6 +315,14 @@ def _modmul_decode(model, cfg, xyp, device, chunk=128):
                     out[i] = ans if ans else [0]
                 else:
                     out[i] = [0]
+            # Release the chunk's activations: the caching allocator otherwise
+            # accumulates across length-groups/chunks (MPS in particular never
+            # frees mid-run) and OOMs on long tier-4 chains.
+            del toks, abac, seg, done, gen
+            if device.type == "mps":
+                torch.mps.empty_cache()
+            elif device.type == "cuda":
+                torch.cuda.empty_cache()
     return [o if o is not None else [0] for o in out]
 
 
@@ -317,6 +337,8 @@ class EBMModMul(ModularMultiplicationModel):
         self.arch = None
         self.mm = None          # tier-3 modmul scratchpad
         self.mm_cfg = None
+        self.mm4 = None         # tier-4 modmul scratchpad
+        self.mm4_cfg = None
 
     def load(self, model_dir: str) -> None:
         if torch.cuda.is_available():
@@ -343,6 +365,16 @@ class EBMModMul(ModularMultiplicationModel):
             ).to(self.device)
             self.mm.load_state_dict(ckpt["tier3"]["state_dict"])
             self.mm.eval()
+        # Tier 4: same scratchpad architecture, trained on [2**17, 2**32).
+        if "tier4" in ckpt:
+            c4 = ckpt["tier4"]["config"]
+            self.mm4_cfg = c4
+            self.mm4 = AbacusDecoder(
+                max_len=c4["max_len"], abacus_max=c4["abacus_max"], d_model=c4["d_model"],
+                nhead=c4["nhead"], num_layers=c4["layers"], dim_ff=c4["dim_ff"],
+            ).to(self.device)
+            self.mm4.load_state_dict(ckpt["tier4"]["state_dict"])
+            self.mm4.eval()
 
     # Per-argument identity preprocessing (each hook sees only its own argument).
     def preprocess_a(self, a): return a
@@ -354,26 +386,34 @@ class EBMModMul(ModularMultiplicationModel):
         return self.predict_digits_batch([(a_enc, b_enc, p_enc)])[0]
 
     # Prime routing: tiers 1-2 (p < 512) use the classification head; tier 3
-    # (512 <= p < 65536) uses the modmul scratchpad; p >= 65536 (tiers 4+) is out
-    # of regime. 512 = 2**9 is exactly the tier-3 floor (see config TIERS).
+    # (512 <= p < 65536) and tier 4 (65536 <= p < 2**32) use the modmul scratchpad
+    # (separate trained weights); p >= 2**32 (tiers 5+) is out of regime.
+    # 512 = 2**9 is the tier-3 floor, 65536 = 2**16 the tier-3/4 boundary (TIERS).
     TIER3_LO = 512
     TIER3_HI = 65536
+    TIER4_HI = 2 ** 32
 
     @torch.no_grad()
     def predict_digits_batch(self, inputs):
         out: list[list[int] | None] = [None] * len(inputs)
         x_rows, y_rows, p_rows, p_ints, idx = [], [], [], [], []   # tiers 1-2
         mm_items, mm_idx = [], []                                  # tier 3
+        mm4_items, mm4_idx = [], []                                # tier 4
 
         for i, (a_enc, b_enc, p_enc) in enumerate(inputs):
             p = int(p_enc)
-            # Out of regime (residues don't fit the fixed-width / trained range): honest 0.
-            if p >= self.TIER3_HI:
+            # Out of regime (residues don't fit the trained range): honest 0.
+            if p >= self.TIER4_HI:
                 out[i] = [0]
                 continue
             a_red = int(a_enc) % p          # per-operand reduction (allowed)
             b_red = int(b_enc) % p
-            if p >= self.TIER3_LO and self.mm is not None:
+            if p >= self.TIER3_HI:
+                if self.mm4 is not None:
+                    mm4_items.append((a_red, b_red, p)); mm4_idx.append(i)
+                else:
+                    out[i] = [0]
+            elif p >= self.TIER3_LO and self.mm is not None:
                 mm_items.append((a_red, b_red, p)); mm_idx.append(i)
             else:
                 x_rows.append(digits_fixed(a_red))
@@ -395,6 +435,14 @@ class EBMModMul(ModularMultiplicationModel):
         if mm_items:
             res = _modmul_decode(self.mm, self.mm_cfg, mm_items, self.device)
             for j, i in enumerate(mm_idx):
+                out[i] = res[j]
+
+        if mm4_items:
+            # Tier-4 chains are ~800 tokens; without a KV-cache the per-step
+            # forward is O(L^2), so decode in small sub-batches to bound peak
+            # memory (a single batch of 100 OOMs on a 20 GB device).
+            res = _modmul_decode(self.mm4, self.mm4_cfg, mm4_items, self.device, chunk=16)
+            for j, i in enumerate(mm4_idx):
                 out[i] = res[j]
 
         return [o if o is not None else [0] for o in out]
