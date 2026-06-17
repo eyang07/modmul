@@ -2,7 +2,7 @@
 
 > **Start-here file.** Point a fresh session at this. It holds the current standing,
 > what's proven, where the artifacts are, the hard constraints, and the next move.
-> Last updated: **2026-06-15.**
+> Last updated: **2026-06-16 — htop90=4 SUBMITTED.**
 
 ---
 
@@ -40,11 +40,11 @@ parameters**, not hand-coded math.
 |---|---|---|
 | 1 | ✅ trivial | fixed small primes {2,3,5,7} — 1.00 |
 | **2** | ✅ **BANKED + SUBMITTED** | `cire77/ebm-modmul @15211043` — 1.00 |
-| **3** | ✅ **SOLVED + SUBMITTED (htop90=3)** | `cire77/modmul-tier3 @ec9691c0` — public-pipeline `evaluate-hf` reproduces htop90=3 (tier3 1.00) |
-| 4 | ⚪ stretch, one cheap data-driven swing later | frontier coin-flip |
+| **3** | ✅ **SOLVED + SUBMITTED** | superseded by the tier-4 submission below; tier3 0.99 |
+| **4** | ✅ **SOLVED + SUBMITTED (htop90=4)** | `cire77/modmul @c13b94de` — CUDA `evaluate-hf` reproduces htop90=4 (tier4 0.95), all tiers completed within 300s |
 | 5–10 | ⚪ out of scope | open / unsolved-ML territory |
 
-**Baselines on the leaderboard sit at htop90=1.** Breaking tier 3 is a genuine result.
+**Baselines on the leaderboard sit at htop90=1.** Reaching tier 4 is a strong result.
 
 > **2026-06-16 — TIER 3 CRACKED.** `modchallenge evaluate` (seed abcd1234, 1100 problems)
 > returns **highest_tier_above_90 = 3**: tier1 1.00, tier2 1.00, **tier3 0.99**, tiers 4+ honest
@@ -61,6 +61,23 @@ parameters**, not hand-coded math.
 > tier2 0.99, tier3 1.00, tiers4+ honest [0], static check passed, deterministic. Robustness
 > confirmed by a 30-seed local sweep (htop90==3 on all 30; tier3 min 0.95 / mean 0.986).
 > repo_id + commit submitted to the organizers.
+>
+> **2026-06-16 — TIER 4 CRACKED + SUBMITTED (htop90=4).** Same scratchpad trick, one level
+> up. The tier-3 7-field format (`d:q1:r1:pp:t:q2:r2`) plateaued at tf_tok~0.80 on tier 4; a
+> per-field diagnostic showed the remainder subtractions r1/r2 were the bottleneck (the
+> implicit `q*p` was never written). **Fix = 9 fields** `d:q1:m1:r1:pp:t:q2:m2:r2` with explicit
+> `m1=q1*p`, `t=r1+pp`, `m2=q2*p`. Trained `modmul_t4_v2_best.pt` (step 57.5k, d384/L8, max_len
+> 803) on `[2^17, 2^32)`; clean n=500 held-out eval: small 0.982 / mid 0.978 / hard
+> `[2^27,2^32)` 0.964. Integrated as a 2nd `AbacusDecoder` under a `tier4` key in weights.pt;
+> routing now <512→cls head, 512–65535→tier3 decoder, 65536–2^32→tier4 decoder, ≥2^32→[0].
+> **Decode memory fix (decisive):** 100 tier-4 problems in one batch OOM'd (the caching
+> allocator holds a buffer per sequence length, ~800 on these chains) → chunk=16 +
+> `empty_cache()` every 32 steps inside the decode loop. Official local scorer (seed abcd1234)
+> = htop90=4 (tier4 0.95); **CUDA `evaluate-hf` on `cire77/modmul @c13b94de5c51efea9080179a2afe6bc513d17c5c`
+> reproduced htop90=4 with all 1100 problems completing within the 300s budget** (MPS's 826s
+> tier-4 time was a Mac-only artifact). repo_id + commit submitted to the organizers.
+> (HF repo renamed `modmul-tier3` → `modmul`; the tier-3 commit ec9691c0 still lives there.)
+> See `memory/tier4-cracked.md`.
 
 ---
 
