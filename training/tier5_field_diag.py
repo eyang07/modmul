@@ -94,8 +94,11 @@ def field_breakdown(model, primes, base, V, n, max_len, rng, device, amp_ctx):
         T.append(toks); A.append(abac); L.append(labels)
     toks = torch.tensor(T, dtype=torch.long, device=device)
     abac = torch.tensor(A, dtype=torch.long, device=device)
-    with amp_ctx:
-        pred = model(toks, abac)[:, :-1].argmax(-1)        # predicts positions 1..
+    preds = []
+    for s in range(0, n, 48):                               # chunk to avoid OOM at long max_len
+        with amp_ctx:
+            preds.append(model(toks[s:s + 48], abac[s:s + 48])[:, :-1].argmax(-1))
+    pred = torch.cat(preds, dim=0)                          # predicts positions 1..
     hit = (pred == toks[:, 1:]).to("cpu")                   # [n, L-1]
 
     correct = defaultdict(int); total = defaultdict(int)

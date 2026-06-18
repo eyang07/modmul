@@ -252,8 +252,9 @@ class AbacusDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def eval_answer(model, primes, base, V, n, max_len, abacus_max, rng, device):
-    """Final-answer exact-match over n products, batched by prompt length."""
+def eval_answer(model, primes, base, V, n, max_len, abacus_max, rng, device, chunk=48):
+    """Final-answer exact-match over n products, batched by prompt length (sub-chunked
+    so the autoregressive decode doesn't OOM once chains grow to full max_len)."""
     model.eval()
     specials_t = torch.tensor(sorted(V["SPECIALS"]), device=device)
 
@@ -268,8 +269,13 @@ def eval_answer(model, primes, base, V, n, max_len, abacus_max, rng, device):
         groups[len(toks)].append(len(samples))
         samples.append((toks, abac, (x * y) % p))
 
-    ok = 0
+    chunks = []
     for L, idxs in groups.items():
+        for cs in range(0, len(idxs), chunk):
+            chunks.append(idxs[cs:cs + chunk])
+
+    ok = 0
+    for idxs in chunks:
         g = len(idxs)
         toks = torch.tensor([samples[i][0] for i in idxs], dtype=torch.long, device=device)
         abac = torch.tensor([samples[i][1] for i in idxs], dtype=torch.long, device=device)
@@ -301,17 +307,22 @@ def eval_answer(model, primes, base, V, n, max_len, abacus_max, rng, device):
 
 
 @torch.no_grad()
-def eval_teacher_forced(model, primes, base, V, n, max_len, rng, device):
+def eval_teacher_forced(model, primes, base, V, n, max_len, rng, device, chunk=48):
     """Cheap smooth signal: (token_acc, seq_acc) over supervised positions. tf_tok is
-    the leading indicator -- autoregressive acc ~= tf_tok^chain."""
+    the leading indicator -- autoregressive acc ~= tf_tok^chain. Forward is chunked so
+    the eval (fp32, no autocast) doesn't OOM at long max_len / large eval-n."""
     model.eval()
     toks, abac, mask = make_batch(n, primes, base, V, max_len, rng, device)
-    pred = model(toks, abac)[:, :-1].argmax(-1)
     target, m = toks[:, 1:], mask[:, 1:]
-    hit = (pred == target) & m
-    tok_acc = hit.sum().item() / max(1, m.sum().item())
-    seq_acc = ((hit == m).all(dim=1)).float().mean().item()
-    return tok_acc, seq_acc
+    tot_hit, tot_tok, seq_ok = 0, 0, 0
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        pred = model(toks[s:e], abac[s:e])[:, :-1].argmax(-1)
+        hit = (pred == target[s:e]) & m[s:e]
+        tot_hit += hit.sum().item()
+        tot_tok += m[s:e].sum().item()
+        seq_ok += ((hit == m[s:e]).all(dim=1)).float().sum().item()
+    return tot_hit / max(1, tot_tok), seq_ok / max(1, n)
 
 
 def log_buckets(p_min: int, p_max: int):
