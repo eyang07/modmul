@@ -427,9 +427,11 @@ def _modmul_decode_base(model, cfg, xyp, device, base, chunk=64):
                 else:
                     out[i] = [0]
             del toks, abac, seg, done, gen
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            elif device.type == "mps":
+            # Only MPS needs the cache drop (it never frees mid-run and OOMs on
+            # long chains). On CUDA, empty_cache() synchronizes + forces the
+            # allocator to re-acquire buffers every chunk -- a ~5x slowdown over
+            # the ~1853-step base-16 decode -- and tier-5 peak is <3 GB anyway.
+            if device.type == "mps":
                 torch.mps.empty_cache()
     return [o if o is not None else [0] for o in out]
 
