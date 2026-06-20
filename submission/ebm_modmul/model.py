@@ -9,11 +9,12 @@ Compliance contract (see rules/evaluation.md):
   ``[0, p)``) materially determines the answer.
 - We emit the residue as base-10 digits (``output_base = 10``); the harness decodes.
 
-Routing by prime size: tiers 1-2 (p < 512) use the classification head; tier 3
-(512 <= p < 65536) and tier 4 (65536 <= p < 2**32) use the interleaved
-modular-multiply scratchpad decoder (same architecture, separately trained
-weights). p >= 2**32 (tiers 5+) is out of regime, so we emit ``[0]`` — an honest
-fallback, not a guess.
+Routing by prime size: tiers 1-2 (p < 512) use the classification head; tiers 3-5
+use the interleaved modular-multiply scratchpad decoder (same architecture,
+separately trained weights) — tier 3 (512 <= p < 65536) and tier 4
+(65536 <= p < 2**32) in numeric base 10, tier 5 (2**32 <= p < 2**64) in numeric
+base 16 (shorter Horner chain at large prime sizes). p >= 2**64 (tiers 6+) is out
+of regime, so we emit ``[0]`` — an honest fallback, not a guess.
 
 The architecture (encoder + classification/angular head) is loaded from the
 checkpoint's ``arch`` field, so the same wrapper serves either trained head.
@@ -230,11 +231,15 @@ def _digits_msb(n: int) -> list[int]:
 
 class AbacusDecoder(nn.Module):
     """Decoder-only transformer with abacus (place-within-number) embeddings.
-    Architecture identical to training/modmul_probe.py for state_dict match."""
+    Architecture identical to training/modmul_probe.py / tier5_modmul.py for
+    state_dict match. ``vocab`` defaults to the base-10 scratchpad vocab (18) used
+    by tiers 3-4; the tier-5 base-16 scratchpad passes vocab=24 (16 digits + 8
+    specials)."""
 
-    def __init__(self, max_len, abacus_max, d_model=384, nhead=8, num_layers=8, dim_ff=1536):
+    def __init__(self, max_len, abacus_max, d_model=384, nhead=8, num_layers=8,
+                 dim_ff=1536, vocab=MM_VOCAB):
         super().__init__()
-        self.tok_emb = nn.Embedding(MM_VOCAB, d_model)
+        self.tok_emb = nn.Embedding(vocab, d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.abacus_emb = nn.Embedding(abacus_max, d_model)
         layer = nn.TransformerEncoderLayer(
@@ -243,7 +248,7 @@ class AbacusDecoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.ln = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, MM_VOCAB, bias=False)
+        self.head = nn.Linear(d_model, vocab, bias=False)
         self.max_len = max_len
         self.register_buffer("pos_ids", torch.arange(max_len), persistent=False)
 
@@ -327,6 +332,109 @@ def _modmul_decode(model, cfg, xyp, device, chunk=128):
 
 
 # ---------------------------------------------------------------------------
+# Tier-5 base-16 modular-multiply scratchpad (autoregressive).
+#
+# Same AbacusDecoder architecture and 9-field Horner scratchpad as tiers 3-4, but
+# trained in numeric BASE 16 (so the per-step partial products / quotient digits
+# stay easy while the chain length is bounded). tier-5 primes are 33-64 bit, so the
+# chain is ~16 base-16 Horner blocks (~1853 tokens). Vocab: digits 0..15 then
+# PAD,BOS,MUL,MOD,EQ,COLON,STEP,EOS = base..base+7 (see tier5_modmul.make_vocab).
+# The decoded answer is a BASE-16 residue; we convert it to base-10 digits with
+# multiply-add only (no %, //, Barrett/Montgomery/CRT on the product) so it matches
+# the global output_base=10. Compliance is unchanged: the only modular reduction in
+# shipped code is the per-operand int(a)%p / int(b)%p done before the network runs.
+# ---------------------------------------------------------------------------
+
+
+def _make_vocab_base(base: int) -> dict:
+    """Base-B scratchpad vocab, matching training/tier5_modmul.make_vocab."""
+    PAD, BOS, MUL, MOD, EQ, COLON, STEP, EOS = (
+        base, base + 1, base + 2, base + 3, base + 4, base + 5, base + 6, base + 7)
+    return dict(PAD=PAD, BOS=BOS, MUL=MUL, MOD=MOD, EQ=EQ, COLON=COLON, STEP=STEP,
+                EOS=EOS, VOCAB=base + 8,
+                SPECIALS={PAD, BOS, MUL, MOD, EQ, COLON, STEP, EOS})
+
+
+def _digits_base_msb(n: int, base: int) -> list[int]:
+    if n == 0:
+        return [0]
+    s = []
+    while n > 0:
+        s.append(n % base)
+        n //= base
+    return s[::-1]
+
+
+def _base_to_int(ds: list[int], base: int) -> int:
+    v = 0
+    for d in ds:
+        v = v * base + d        # multiply-add only; no %/// on the product
+    return v
+
+
+@torch.no_grad()
+def _modmul_decode_base(model, cfg, xyp, device, base, chunk=64):
+    """Greedy-decode (x*y) mod p in numeric base ``base`` for each (x, y, p) with
+    x, y already in [0, p). Returns base-10 digit-lists (MSB-first), or [0] if
+    unparseable. Mirrors _modmul_decode but base-parametrized; the final base-``base``
+    residue is re-expressed in base 10 via multiply-add (compliant)."""
+    V = _make_vocab_base(base)
+    PAD, EOS, COLON = V["PAD"], V["EOS"], V["COLON"]
+    max_len, abmax = cfg["max_len"], cfg["abacus_max"]
+    specials = torch.tensor(sorted(V["SPECIALS"]), device=device)
+    out: list[list[int] | None] = [None] * len(xyp)
+
+    groups = defaultdict(list)
+    prompts = []
+    for i, (x, y, p) in enumerate(xyp):
+        xd, yd, pd = (_digits_base_msb(x, base), _digits_base_msb(y, base),
+                      _digits_base_msb(p, base))
+        toks = [V["BOS"]] + xd + [V["MUL"]] + yd + [V["MOD"]] + pd + [V["EQ"]]
+        abac = ([0] + list(range(len(xd))) + [0] + list(range(len(yd)))
+                + [0] + list(range(len(pd))) + [0])
+        groups[len(toks)].append(i)
+        prompts.append((toks, abac))
+
+    for L, idxs in groups.items():
+        for s in range(0, len(idxs), chunk):
+            sub = idxs[s:s + chunk]
+            g = len(sub)
+            toks = torch.tensor([prompts[i][0] for i in sub], dtype=torch.long, device=device)
+            abac = torch.tensor([prompts[i][1] for i in sub], dtype=torch.long, device=device)
+            seg = torch.zeros(g, dtype=torch.long, device=device)
+            done = torch.zeros(g, dtype=torch.bool, device=device)
+            gen = [[] for _ in range(g)]
+            while toks.shape[1] < max_len and not bool(done.all()):
+                nxt = model(toks, abac)[:, -1].argmax(-1)
+                nxt = torch.where(done, torch.full_like(nxt, PAD), nxt)
+                is_sp = (nxt.unsqueeze(1) == specials).any(1)
+                new_abac = torch.where(is_sp, torch.zeros_like(seg),
+                                       torch.clamp(seg, max=abmax - 1))
+                seg = torch.where(is_sp, torch.zeros_like(seg), seg + 1)
+                nc, dc = nxt.tolist(), done.tolist()
+                for j in range(g):
+                    if not dc[j] and nc[j] != EOS and nc[j] != PAD:
+                        gen[j].append(nc[j])
+                toks = torch.cat([toks, nxt.unsqueeze(1)], dim=1)
+                abac = torch.cat([abac, new_abac.unsqueeze(1)], dim=1)
+                done = done | (nxt == EOS)
+            for j, i in enumerate(sub):
+                gj = gen[j]
+                if COLON in gj:
+                    k = len(gj) - 1 - gj[::-1].index(COLON)
+                    ans = [d for d in gj[k + 1:] if d < base]
+                    out[i] = int_to_decimal_digits(_base_to_int(ans, base)) if ans else [0]
+                else:
+                    out[i] = [0]
+            del toks, abac, seg, done, gen
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            elif device.type == "mps":
+                torch.mps.empty_cache()
+    return [o if o is not None else [0] for o in out]
+
+
+# ---------------------------------------------------------------------------
 # Submission entry class
 # ---------------------------------------------------------------------------
 
@@ -339,6 +447,8 @@ class EBMModMul(ModularMultiplicationModel):
         self.mm_cfg = None
         self.mm4 = None         # tier-4 modmul scratchpad
         self.mm4_cfg = None
+        self.mm5 = None         # tier-5 base-16 modmul scratchpad
+        self.mm5_cfg = None
 
     def load(self, model_dir: str) -> None:
         if torch.cuda.is_available():
@@ -375,6 +485,17 @@ class EBMModMul(ModularMultiplicationModel):
             ).to(self.device)
             self.mm4.load_state_dict(ckpt["tier4"]["state_dict"])
             self.mm4.eval()
+        # Tier 5: base-16 scratchpad, trained on primes in [2**33, 2**64).
+        if "tier5" in ckpt:
+            c5 = ckpt["tier5"]["config"]
+            self.mm5_cfg = c5
+            self.mm5 = AbacusDecoder(
+                max_len=c5["max_len"], abacus_max=c5["abacus_max"], d_model=c5["d_model"],
+                nhead=c5["nhead"], num_layers=c5["layers"], dim_ff=c5["dim_ff"],
+                vocab=c5["base"] + 8,
+            ).to(self.device)
+            self.mm5.load_state_dict(ckpt["tier5"]["state_dict"])
+            self.mm5.eval()
 
     # Per-argument identity preprocessing (each hook sees only its own argument).
     def preprocess_a(self, a): return a
@@ -392,6 +513,7 @@ class EBMModMul(ModularMultiplicationModel):
     TIER3_LO = 512
     TIER3_HI = 65536
     TIER4_HI = 2 ** 32
+    TIER5_HI = 2 ** 64
 
     @torch.no_grad()
     def predict_digits_batch(self, inputs):
@@ -399,16 +521,22 @@ class EBMModMul(ModularMultiplicationModel):
         x_rows, y_rows, p_rows, p_ints, idx = [], [], [], [], []   # tiers 1-2
         mm_items, mm_idx = [], []                                  # tier 3
         mm4_items, mm4_idx = [], []                                # tier 4
+        mm5_items, mm5_idx = [], []                                # tier 5
 
         for i, (a_enc, b_enc, p_enc) in enumerate(inputs):
             p = int(p_enc)
             # Out of regime (residues don't fit the trained range): honest 0.
-            if p >= self.TIER4_HI:
+            if p >= self.TIER5_HI:
                 out[i] = [0]
                 continue
             a_red = int(a_enc) % p          # per-operand reduction (allowed)
             b_red = int(b_enc) % p
-            if p >= self.TIER3_HI:
+            if p >= self.TIER4_HI:
+                if self.mm5 is not None:
+                    mm5_items.append((a_red, b_red, p)); mm5_idx.append(i)
+                else:
+                    out[i] = [0]
+            elif p >= self.TIER3_HI:
                 if self.mm4 is not None:
                     mm4_items.append((a_red, b_red, p)); mm4_idx.append(i)
                 else:
@@ -443,6 +571,15 @@ class EBMModMul(ModularMultiplicationModel):
             # memory (a single batch of 100 OOMs on a 20 GB device).
             res = _modmul_decode(self.mm4, self.mm4_cfg, mm4_items, self.device, chunk=16)
             for j, i in enumerate(mm4_idx):
+                out[i] = res[j]
+
+        if mm5_items:
+            # Tier-5 base-16 chains are ~1853 tokens. Decode is throughput-bound,
+            # not memory-bound (peak <3 GB at chunk 64), so a larger chunk amortizes
+            # the per-step forward without OOM risk.
+            res = _modmul_decode_base(self.mm5, self.mm5_cfg, mm5_items, self.device,
+                                      base=self.mm5_cfg["base"], chunk=64)
+            for j, i in enumerate(mm5_idx):
                 out[i] = res[j]
 
         return [o if o is not None else [0] for o in out]
