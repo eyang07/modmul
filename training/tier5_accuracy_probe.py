@@ -33,8 +33,25 @@ import random
 import torch
 
 from tier5_modmul import (
-    AbacusDecoder, build_prime_pool, eval_answer, make_vocab, pick_device,
+    AbacusDecoder, _is_prime, eval_answer, make_vocab, pick_device,
 )
+
+
+def draw_scorer_primes(p_min, p_max, k, rng):
+    """Scorer-faithful prime draw: nextprime(randrange(p_min, p_max)), i.e. UNIFORM
+    IN VALUE -- this is what testgen/primes.py does, so ~50% of [2^33,2^64) primes
+    are 64-bit, ~75% are 63-64 bit. (build_prime_pool is LOG-uniform = uniform in
+    bits, which over-samples the easy low end and inflates the estimate.)"""
+    out: set[int] = set()
+    while len(out) < k:
+        n = rng.randrange(p_min, p_max) | 1
+        while not _is_prime(n):
+            n += 2
+            if n >= p_max:          # overshoot -> retry from a fresh draw
+                break
+        else:
+            out.add(n)
+    return sorted(out)
 
 
 def main() -> int:
@@ -69,15 +86,19 @@ def main() -> int:
     amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                if use_amp else contextlib.nullcontext())
 
-    # Scorer-faithful prime draw: uniform in value over [2^33, 2^64) -> same
-    # bit-size distribution (heavily 63-64 bit) as nextprime(randrange(...)).
+    # Scorer-faithful prime draw: UNIFORM IN VALUE (testgen/primes.py), so the
+    # primes concentrate at 63-64 bit exactly like the real tier-5 test.
     pool_rng = random.Random(args.seed + 777)
-    primes = build_prime_pool(cfg["p_min"], cfg["p_max"], args.primes, pool_rng)
+    primes = draw_scorer_primes(cfg["p_min"], cfg["p_max"], args.primes, pool_rng)
+    bits = [p.bit_length() for p in primes]
+    print(f"\nprime bit-lengths (scorer value-uniform draw): "
+          f"min {min(bits)} max {max(bits)} | 64-bit {bits.count(64)}/{len(bits)} "
+          f"| 63-64 {sum(b>=63 for b in bits)}/{len(bits)}", flush=True)
 
     per_prime = []
     rng = random.Random(args.seed)
-    print(f"\ntesting {len(primes)} primes x {args.per_prime} problems "
-          f"(uniform-in-value draw, ~scorer distribution):", flush=True)
+    print(f"testing {len(primes)} primes x {args.per_prime} problems "
+          f"(uniform-in-value draw, scorer distribution):", flush=True)
     for k, p in enumerate(primes):
         with amp_ctx:
             acc = eval_answer(model, [p], B, V, args.per_prime, max_len, abmax,
