@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import sys
 from pathlib import Path
 
 import torch
@@ -39,13 +38,15 @@ def main() -> int:
           f"| base {cfg['base']} max_len {cfg['max_len']} d_model {cfg['d_model']} "
           f"layers {cfg['layers']}")
 
-    # Parity check: the base-16 state_dict must load into the submission decoder.
-    sys.path.insert(0, str(Path(args.weights).resolve().parent))
-    from model import AbacusDecoder  # noqa: E402
-    m = AbacusDecoder(max_len=cfg["max_len"], abacus_max=cfg["abacus_max"],
-                      d_model=cfg["d_model"], nhead=cfg["nhead"],
-                      num_layers=cfg["layers"], dim_ff=cfg["dim_ff"],
-                      vocab=cfg["base"] + 8)
+    # Parity check: the base-16 state_dict must load into an AbacusDecoder built
+    # with vocab = base + 8. We use the training AbacusDecoder (identical module
+    # structure / state_dict keys to the submission's, but importable with only
+    # torch -- the submission's model.py pulls in modchallenge). training/ is on
+    # sys.path[0] because this script is invoked as `python training/bundle_tier5.py`.
+    from tier5_modmul import AbacusDecoder  # noqa: E402
+    m = AbacusDecoder(vocab=cfg["base"] + 8, max_len=cfg["max_len"],
+                      abacus_max=cfg["abacus_max"], d_model=cfg["d_model"],
+                      nhead=cfg["nhead"], num_layers=cfg["layers"], dim_ff=cfg["dim_ff"])
     missing, unexpected = m.load_state_dict(t5["model"], strict=True)
     print(f"state_dict parity OK (missing={list(missing)}, unexpected={list(unexpected)})")
 
