@@ -474,13 +474,18 @@ def main() -> int:
 
         if step % args.eval_every == 0:
             parts, accs = [], []
-            for lo, hi, ps in buckets:
-                acc = eval_answer(model, ps, B, V, args.eval_n, max_len, abacus_max,
-                                  eval_rng, device)
-                accs.append(acc)
-                parts.append(f"[{lo}-{hi}) acc {acc:.3f}")
-            tf_tok, tf_seq = eval_teacher_forced(model, POOL, B, V, args.eval_n, max_len,
-                                                 eval_rng, device)
+            # Eval under the SAME bf16 autocast as training. In fp32 the decode's
+            # attention kernel can hit "unspecified launch failure" at long max_len
+            # (base-16 -> 1853); bf16 matches the proven-working training forward and
+            # halves attention memory/kernel size.
+            with amp_ctx:
+                for lo, hi, ps in buckets:
+                    acc = eval_answer(model, ps, B, V, args.eval_n, max_len, abacus_max,
+                                      eval_rng, device)
+                    accs.append(acc)
+                    parts.append(f"[{lo}-{hi}) acc {acc:.3f}")
+                tf_tok, tf_seq = eval_teacher_forced(model, POOL, B, V, args.eval_n, max_len,
+                                                     eval_rng, device)
             print(f"step {step:6d} | loss {loss.item():.4f} | " + " | ".join(parts)
                   + f" | tf_tok {tf_tok:.3f} tf_seq {tf_seq:.3f}"
                   + f" | cur_pmax {cur_pmax(step)} | {time.monotonic()-start:.0f}s")
