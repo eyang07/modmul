@@ -206,11 +206,20 @@ def build_example(x: int, y: int, p: int, base: int, V: dict, max_len: int):
     return toks, abac, is_out
 
 
-def make_batch(batch, primes, base, V, max_len, rng, device):
-    """x, y ~ U[0, p) for p sampled uniformly from the pool."""
+def make_batch(batch, primes, base, V, max_len, rng, device, wcum=None):
+    """x, y ~ U[0, p) for p sampled from the pool. If ``wcum`` (cumulative weights
+    aligned to ``primes``) is given, p is drawn weighted by it -- weight p^alpha makes
+    the training prime distribution value-uniform (alpha=1) to match the scorer, which
+    draws nextprime(randrange(2^33,2^64)) and so lands ~50% at 64-bit. Without weights,
+    p is uniform over the pool (= uniform in bits, which under-samples the high end)."""
     T, A, M = [], [], []
+    n = len(primes)
     for _ in range(batch):
-        p = primes[rng.randrange(len(primes))]
+        if wcum is not None:
+            r = rng.uniform(0.0, wcum[n - 1])
+            p = primes[bisect.bisect_left(wcum, r, 0, n)]
+        else:
+            p = primes[rng.randrange(n)]
         x, y = rng.randrange(p), rng.randrange(p)
         t, ab, m = build_example(x, y, p, base, V, max_len)
         T.append(t); A.append(ab); M.append(m)
@@ -356,6 +365,9 @@ def main() -> int:
     ap.add_argument("--curriculum", action="store_true",
                     help="ramp the prime ceiling small->large over --curr-frac of training")
     ap.add_argument("--curr-frac", type=float, default=0.6)
+    ap.add_argument("--prime-pow", type=float, default=0.0,
+                    help="weight prime sampling by p^alpha (1.0 = value-uniform, "
+                         "scorer-matched; 0.0 = uniform over pool = uniform in bits)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ckpt", type=str, default="training/checkpoints/modmul_t5.pt")
     ap.add_argument("--resume", action="store_true")
@@ -403,6 +415,20 @@ def main() -> int:
         ps = [p for p in POOL if lo <= p < hi]
         if ps:
             buckets.append((lo, hi, ps))
+
+    # Optional value-weighted prime sampling (scorer-matched). Weight p^alpha; the
+    # log-uniform pool has density ~1/p in value, so alpha=1 -> uniform in value.
+    # Cumulative weights over the sorted POOL; primes_now = POOL[:hi] uses wcum[:hi].
+    wcum = None
+    if args.prime_pow > 0:
+        acc, wcum = 0.0, []
+        lmax = args.prime_pow * math.log(args.p_max)
+        for p in POOL:
+            acc += math.exp(args.prime_pow * math.log(p) - lmax)
+            wcum.append(acc)
+        n64 = sum(1 for p in POOL if p.bit_length() == 64)
+        print(f"prime-pow {args.prime_pow}: value-weighted sampling on "
+              f"(pool 64-bit fraction {n64/len(POOL):.3f}; sampling weight ~p^{args.prime_pow})")
 
     model = AbacusDecoder(V["VOCAB"], max_len, abacus_max, d_model=args.d_model,
                           nhead=args.nhead, num_layers=args.layers, dim_ff=args.dim_ff).to(device)
@@ -460,7 +486,8 @@ def main() -> int:
         model.train()
         hi = bisect.bisect_left(POOL, cur_pmax(step))
         primes_now = POOL[:hi] if hi > 0 else POOL[:1]
-        toks, abac, mask = make_batch(args.batch, primes_now, B, V, max_len, rng, device)
+        toks, abac, mask = make_batch(args.batch, primes_now, B, V, max_len, rng, device,
+                                      wcum=wcum)
         with amp_ctx:
             logits = model(toks, abac)
             logits = logits[:, :-1].reshape(-1, V["VOCAB"])
