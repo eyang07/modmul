@@ -576,11 +576,18 @@ class EBMModMul(ModularMultiplicationModel):
                 out[i] = res[j]
 
         if mm5_items:
-            # Tier-5 base-16 chains are ~1853 tokens. Decode is throughput-bound,
-            # not memory-bound (peak <3 GB at chunk 64), so a larger chunk amortizes
-            # the per-step forward without OOM risk.
-            res = _modmul_decode_base(self.mm5, self.mm5_cfg, mm5_items, self.device,
-                                      base=self.mm5_cfg["base"], chunk=64)
+            # Tier-5 base-16 chains are ~1853 tokens. The model was trained under
+            # bf16 autocast, and decoding in bf16 (not fp32) is what keeps the long
+            # attention both fast (~125s/100 vs ~470-660s in fp32) and within memory
+            # (<3 GB vs a fp32 OOM at 1853-length attention). Match training precision.
+            if self.device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    res = _modmul_decode_base(self.mm5, self.mm5_cfg, mm5_items,
+                                              self.device, base=self.mm5_cfg["base"],
+                                              chunk=64)
+            else:
+                res = _modmul_decode_base(self.mm5, self.mm5_cfg, mm5_items,
+                                          self.device, base=self.mm5_cfg["base"], chunk=64)
             for j, i in enumerate(mm5_idx):
                 out[i] = res[j]
 
