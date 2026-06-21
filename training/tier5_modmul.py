@@ -481,6 +481,7 @@ def main() -> int:
     if use_amp:
         print("bf16 autocast ON")
     start = time.monotonic()
+    n_skipped = 0
 
     for step in range(start_step + 1, args.steps + 1):
         model.train()
@@ -495,9 +496,17 @@ def main() -> int:
             m = mask[:, 1:].reshape(-1)
             loss = loss_fn(logits[m], target[m])
         opt.zero_grad(); loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        opt.step(); sched.step()
+        gnorm = (torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                 if args.grad_clip > 0 else None)
+        # bf16 autocast can emit a non-finite loss/grad on an occasional hard batch
+        # (seen mid-curriculum as cur_pmax climbs). A single NaN/Inf step permanently
+        # corrupts AdamW's moments -- the run pins at ~chance and never recovers. Skip
+        # the optimizer step (but keep the LR schedule aligned to step count).
+        if not torch.isfinite(loss) or (gnorm is not None and not torch.isfinite(gnorm)):
+            n_skipped += 1
+        else:
+            opt.step()
+        sched.step()
 
         if step % args.eval_every == 0:
             parts, accs = [], []
@@ -515,7 +524,8 @@ def main() -> int:
                                                      eval_rng, device)
             print(f"step {step:6d} | loss {loss.item():.4f} | " + " | ".join(parts)
                   + f" | tf_tok {tf_tok:.3f} tf_seq {tf_seq:.3f}"
-                  + f" | cur_pmax {cur_pmax(step)} | {time.monotonic()-start:.0f}s")
+                  + f" | cur_pmax {cur_pmax(step)} | skip {n_skipped}"
+                  + f" | {time.monotonic()-start:.0f}s")
             save_ckpt(args.ckpt, step, best)
             score = accs[-1] if accs else 0.0                  # hardest bucket
             if args.ckpt and score > best:
