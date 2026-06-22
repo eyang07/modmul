@@ -1,5 +1,9 @@
 # PROJECT STATE — SAIR Modular Arithmetic Challenge
 
+> ⏩ **RESUMING THE TIER-6 PUSH? Open `training/TIER6_NEXT.md` first** — command-first
+> "run these exact things in order" guide (gates → train → submit). This file below is the
+> longer-form history/context.
+
 > **Start-here file.** Point a fresh session at this. It holds the current standing,
 > what's proven, where the artifacts are, the hard constraints, and the next move.
 > Last updated: **2026-06-22 — htop90=5 SUBMITTED (tier 5 is a coin flip; floor htop90=4).**
