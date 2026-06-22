@@ -2,7 +2,16 @@
 
 > **Start-here file.** Point a fresh session at this. It holds the current standing,
 > what's proven, where the artifacts are, the hard constraints, and the next move.
-> Last updated: **2026-06-16 — htop90=4 SUBMITTED.**
+> Last updated: **2026-06-22 — htop90=5 SUBMITTED (tier 5 is a coin flip; floor htop90=4).**
+
+> **2026-06-22 — TIER 5 SHIPPED.** Submitted `cire77/modmul @ 9e19660897a11c140fc8238aa71f78c3562cdadf`.
+> `evaluate-hf` (official download+run path) reproduced **htop90=5**: tiers 1–4 1.00/1.00/0.99/0.95,
+> **tier5 0.90**, deterministic, static check passed, tier-5 decode 174.6s of 300s. Shipped checkpoint =
+> base-16 d512/L10 `modmul_t5_b16_d512_best.pt` (Iteration-3 fallback). Tier 5 is a **coin flip** on the
+> organizers' secret seed (expected ~0.90, P(htop90=5) ≈ 0.55–0.62); **floor is htop90=4** and the
+> leaderboard keeps your best, so shipping is upside-only. The `--prime-pow 1.0` reweight (Iteration 4)
+> tied the fallback, did not beat it. See `memory/tier5-submitted.md` for the ranked levers to push higher
+> (scratchpad re-engineering > targeted hard-prime fine-tune > scale-up).
 
 ---
 
