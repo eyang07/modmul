@@ -55,6 +55,7 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +333,105 @@ def eval_teacher_forced(model, primes, base, V, n, max_len, rng, device, chunk=4
         tot_tok += m[s:e].sum().item()
         seq_ok += ((hit == m[s:e]).all(dim=1)).float().sum().item()
     return tot_hit / max(1, tot_tok), seq_ok / max(1, n)
+
+
+# ---------------------------------------------------------------------------
+# Greedy decoders shared by eval + the submission. Two implementations that must
+# produce IDENTICAL token streams:
+#   * decode_nocache -- the proven O(L^3) path (recomputes the full prefix every
+#     step); literally eval_answer's inner loop, kept as the parity reference.
+#   * decode_cached  -- O(L^2) KV-cache: hand-rolled incremental post-LN forward
+#     over the trained TransformerEncoderLayer weights (PyTorch's layer has no
+#     incremental path). This is what makes tier 6 (L~3000+) fit the 300s budget
+#     and nearly frees tier 5's decode. Validate equality with tier6_kvcache_probe.
+# Both take prompt tensors toks/abac (B, T0) of UNIFORM length and return, per row,
+# the generated token list (prompt/EOS/PAD excluded).
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def decode_nocache(model, toks, abac, max_len, abacus_max, specials_t, V):
+    g = toks.shape[0]
+    seg = torch.zeros(g, dtype=torch.long, device=toks.device)
+    done = torch.zeros(g, dtype=torch.bool, device=toks.device)
+    gen = [[] for _ in range(g)]
+    while toks.shape[1] < max_len and not bool(done.all()):
+        nxt = model(toks, abac)[:, -1].argmax(-1)
+        nxt = torch.where(done, torch.full_like(nxt, V["PAD"]), nxt)
+        is_special = (nxt.unsqueeze(1) == specials_t).any(1)
+        new_abac = torch.where(is_special, torch.zeros_like(seg),
+                               torch.clamp(seg, max=abacus_max - 1))
+        seg = torch.where(is_special, torch.zeros_like(seg), seg + 1)
+        nl, dl = nxt.tolist(), done.tolist()
+        for j in range(g):
+            if not dl[j] and nl[j] != V["EOS"] and nl[j] != V["PAD"]:
+                gen[j].append(nl[j])
+        toks = torch.cat([toks, nxt.unsqueeze(1)], dim=1)
+        abac = torch.cat([abac, new_abac.unsqueeze(1)], dim=1)
+        done = done | (nxt == V["EOS"])
+    return gen
+
+
+def _sdpa_layer_step(layer, h_new, past_k, past_v):
+    """One post-LN nn.TransformerEncoderLayer applied to h_new (B, Tn, d) with a KV
+    cache. Replicates norm_first=False / gelu / dropout=0 exactly. past_k/past_v are
+    (B, nhead, Tp, d_head) or None. Returns (h_out, k_full, v_full). is_causal=(Tn>1)
+    handles both the prefill (Tn=T0, no past) and the per-step (Tn=1, with past) cases;
+    we never run Tn>1 WITH a past."""
+    attn = layer.self_attn
+    B, Tn, d = h_new.shape
+    nh = attn.num_heads
+    dh = d // nh
+    qkv = F.linear(h_new, attn.in_proj_weight, attn.in_proj_bias)
+    q, k, v = qkv.split(d, dim=-1)
+    shp = lambda z: z.view(B, Tn, nh, dh).transpose(1, 2)
+    q, k, v = shp(q), shp(k), shp(v)
+    if past_k is not None:
+        k = torch.cat([past_k, k], dim=2)
+        v = torch.cat([past_v, v], dim=2)
+    ao = F.scaled_dot_product_attention(q, k, v, is_causal=(Tn > 1))
+    ao = ao.transpose(1, 2).reshape(B, Tn, d)
+    h = layer.norm1(h_new + attn.out_proj(ao))
+    h = layer.norm2(h + layer.linear2(F.gelu(layer.linear1(h))))
+    return h, k, v
+
+
+@torch.no_grad()
+def decode_cached(model, toks, abac, max_len, abacus_max, specials_t, V):
+    device = toks.device
+    layers = model.transformer.layers
+    B, T0 = toks.shape
+    # prefill: run the whole prompt once, caching K/V per layer.
+    h = (model.tok_emb(toks) + model.pos_emb(model.pos_ids[:T0])
+         + model.abacus_emb(abac))
+    pk = [None] * len(layers); pv = [None] * len(layers)
+    for li, layer in enumerate(layers):
+        h, pk[li], pv[li] = _sdpa_layer_step(layer, h, None, None)
+    nxt = model.head(model.ln(h[:, -1])).argmax(-1)
+
+    seg = torch.zeros(B, dtype=torch.long, device=device)
+    done = torch.zeros(B, dtype=torch.bool, device=device)
+    gen = [[] for _ in range(B)]
+    place = T0                                   # absolute position nxt will occupy
+    while place < max_len and not bool(done.all()):
+        nxt = torch.where(done, torch.full_like(nxt, V["PAD"]), nxt)
+        is_special = (nxt.unsqueeze(1) == specials_t).any(1)
+        new_abac = torch.where(is_special, torch.zeros_like(seg),
+                               torch.clamp(seg, max=abacus_max - 1))
+        seg = torch.where(is_special, torch.zeros_like(seg), seg + 1)
+        nl, dl = nxt.tolist(), done.tolist()
+        for j in range(B):
+            if not dl[j] and nl[j] != V["EOS"] and nl[j] != V["PAD"]:
+                gen[j].append(nl[j])
+        done = done | (nxt == V["EOS"])
+        if place + 1 >= max_len or bool(done.all()):
+            break
+        h = (model.tok_emb(nxt) + model.pos_emb(model.pos_ids[place])
+             + model.abacus_emb(new_abac)).unsqueeze(1)
+        for li, layer in enumerate(layers):
+            h, pk[li], pv[li] = _sdpa_layer_step(layer, h, pk[li], pv[li])
+        nxt = model.head(model.ln(h[:, -1])).argmax(-1)
+        place += 1
+    return gen
 
 
 def log_buckets(p_min: int, p_max: int):
