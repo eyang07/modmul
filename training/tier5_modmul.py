@@ -167,7 +167,13 @@ def pick_device() -> torch.device:
 # reset to 0 after every special token. Everything after EQ is supervised.
 # ---------------------------------------------------------------------------
 
-def build_example(x: int, y: int, p: int, base: int, V: dict, max_len: int):
+def build_example(x: int, y: int, p: int, base: int, V: dict, max_len: int,
+                  self_check: bool = False):
+    """If self_check, emit a borrow-check field bk = (p-1) - r BEFORE each remainder
+    r1/r2. bk >= 0 iff r < p, so it forces the model to confirm the reduction bound and
+    cross-checks the quotient digit (the dominant off-by-one error). Emitting bk *before*
+    r keeps r2 the LAST field, so the answer parse (digits after the final colon) is
+    unchanged in both eval and the submission. bk = (p-1)-r is subtraction only."""
     xd, yd, pd = digits_base(x, base), digits_base(y, base), digits_base(p, base)
     toks = [V["BOS"]] + xd + [V["MUL"]] + yd + [V["MOD"]] + pd + [V["EQ"]]
     abac = ([0] + list(range(len(xd))) + [0] + list(range(len(yd)))
@@ -184,18 +190,25 @@ def build_example(x: int, y: int, p: int, base: int, V: dict, max_len: int):
     def emit_digit(v):          # single 0..B-1 value
         emit(v, 0)
 
+    def emit_field(n):          # COLON + multi-digit number
+        emit(V["COLON"], 0); emit_num(n)
+
     for i, (d, q1, m1, r1, pp, t, q2, m2, r2) in enumerate(modmul_rows(x, y, p, base)):
         if i > 0:
             emit(V["STEP"], 0)
         emit_digit(d)
         emit(V["COLON"], 0); emit_digit(q1)
-        emit(V["COLON"], 0); emit_num(m1)
-        emit(V["COLON"], 0); emit_num(r1)
-        emit(V["COLON"], 0); emit_num(pp)
-        emit(V["COLON"], 0); emit_num(t)
+        emit_field(m1)
+        if self_check:
+            emit_field(p - 1 - r1)
+        emit_field(r1)
+        emit_field(pp)
+        emit_field(t)
         emit(V["COLON"], 0); emit_digit(q2)
-        emit(V["COLON"], 0); emit_num(m2)
-        emit(V["COLON"], 0); emit_num(r2)
+        emit_field(m2)
+        if self_check:
+            emit_field(p - 1 - r2)
+        emit_field(r2)
     emit(V["EOS"], 0)
 
     pad = max_len - len(toks)
@@ -207,7 +220,7 @@ def build_example(x: int, y: int, p: int, base: int, V: dict, max_len: int):
     return toks, abac, is_out
 
 
-def make_batch(batch, primes, base, V, max_len, rng, device, wcum=None):
+def make_batch(batch, primes, base, V, max_len, rng, device, wcum=None, self_check=False):
     """x, y ~ U[0, p) for p sampled from the pool. If ``wcum`` (cumulative weights
     aligned to ``primes``) is given, p is drawn weighted by it -- weight p^alpha makes
     the training prime distribution value-uniform (alpha=1) to match the scorer, which
@@ -222,7 +235,7 @@ def make_batch(batch, primes, base, V, max_len, rng, device, wcum=None):
         else:
             p = primes[rng.randrange(n)]
         x, y = rng.randrange(p), rng.randrange(p)
-        t, ab, m = build_example(x, y, p, base, V, max_len)
+        t, ab, m = build_example(x, y, p, base, V, max_len, self_check=self_check)
         T.append(t); A.append(ab); M.append(m)
     tt = lambda v, dt: torch.tensor(v, dtype=dt, device=device)
     return tt(T, torch.long), tt(A, torch.long), tt(M, torch.bool)
@@ -317,12 +330,14 @@ def eval_answer(model, primes, base, V, n, max_len, abacus_max, rng, device, chu
 
 
 @torch.no_grad()
-def eval_teacher_forced(model, primes, base, V, n, max_len, rng, device, chunk=48):
+def eval_teacher_forced(model, primes, base, V, n, max_len, rng, device, chunk=48,
+                        self_check=False):
     """Cheap smooth signal: (token_acc, seq_acc) over supervised positions. tf_tok is
     the leading indicator -- autoregressive acc ~= tf_tok^chain. Forward is chunked so
     the eval (fp32, no autocast) doesn't OOM at long max_len / large eval-n."""
     model.eval()
-    toks, abac, mask = make_batch(n, primes, base, V, max_len, rng, device)
+    toks, abac, mask = make_batch(n, primes, base, V, max_len, rng, device,
+                                  self_check=self_check)
     target, m = toks[:, 1:], mask[:, 1:]
     tot_hit, tot_tok, seq_ok = 0, 0, 0
     for s in range(0, n, chunk):
@@ -468,6 +483,9 @@ def main() -> int:
     ap.add_argument("--prime-pow", type=float, default=0.0,
                     help="weight prime sampling by p^alpha (1.0 = value-uniform, "
                          "scorer-matched; 0.0 = uniform over pool = uniform in bits)")
+    ap.add_argument("--self-check", action="store_true",
+                    help="emit bk=(p-1)-r before each remainder (reduction-bound check; "
+                         "solidifies the reduction step, keeps r2 last so parse is unchanged)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ckpt", type=str, default="training/checkpoints/modmul_t5.pt")
     ap.add_argument("--resume", action="store_true")
@@ -490,14 +508,17 @@ def main() -> int:
     pd = len(digits_base(args.p_max - 1, B))            # prime / operand / remainder width
     ppd = len(digits_base((B - 1) * (args.p_max - 1), B))  # m1, pp, m2 (< B*p)
     td = len(digits_base(B * (args.p_max - 1), B))      # t = r1 + pp (< B*p)
-    abacus_max = max(ppd, td, pd) + 2
-    # per block: d : q1 : m1 : r1 : pp : t : q2 : m2 : r2  (+ STEP)
-    #   single digits d,q1,q2 ; wide m1,pp,m2 (ppd) ; r1,r2 (pd) ; t (td) ; 8 colons + STEP
+    abacus_max = max(ppd, td, pd) + 2                   # bk is pd-wide < ppd, no change
+    # per block: d : q1 : m1 [: bk1] : r1 : pp : t : q2 : m2 [: bk2] : r2  (+ STEP)
+    #   single digits d,q1,q2 ; wide m1,pp,m2 (ppd) ; r1,r2 (pd) ; t (td) ; colons + STEP
+    #   self-check adds bk1,bk2 (pd each) + 2 colons.
+    sc_extra = (2 * pd + 2) if args.self_check else 0
     block = (1 + 1 + 1            # d, q1, q2
              + 3 * ppd            # m1, pp, m2
              + 2 * pd             # r1, r2
              + td                 # t
-             + 8 + 1)             # colons + STEP
+             + 8 + 1              # colons + STEP
+             + sc_extra)          # bk1, bk2 (+ their colons) when --self-check
     header = 1 + pd + 1 + pd + 1 + pd + 1               # BOS x MUL y MOD p EQ
     max_len = header + pd * block + 1 + 8               # EOS + slack
 
@@ -557,7 +578,7 @@ def main() -> int:
 
     cfg = dict(base=B, d_model=args.d_model, layers=args.layers, nhead=args.nhead,
                dim_ff=args.dim_ff, max_len=max_len, abacus_max=abacus_max,
-               p_min=args.p_min, p_max=args.p_max)
+               p_min=args.p_min, p_max=args.p_max, self_check=args.self_check)
 
     def save_ckpt(path, step, best):
         if not args.ckpt:
@@ -588,7 +609,7 @@ def main() -> int:
         hi = bisect.bisect_left(POOL, cur_pmax(step))
         primes_now = POOL[:hi] if hi > 0 else POOL[:1]
         toks, abac, mask = make_batch(args.batch, primes_now, B, V, max_len, rng, device,
-                                      wcum=wcum)
+                                      wcum=wcum, self_check=args.self_check)
         with amp_ctx:
             logits = model(toks, abac)
             logits = logits[:, :-1].reshape(-1, V["VOCAB"])
@@ -621,7 +642,8 @@ def main() -> int:
                     accs.append(acc)
                     parts.append(f"[{lo}-{hi}) acc {acc:.3f}")
                 tf_tok, tf_seq = eval_teacher_forced(model, POOL, B, V, args.eval_n, max_len,
-                                                     eval_rng, device)
+                                                     eval_rng, device,
+                                                     self_check=args.self_check)
             print(f"step {step:6d} | loss {loss.item():.4f} | " + " | ".join(parts)
                   + f" | tf_tok {tf_tok:.3f} tf_seq {tf_seq:.3f}"
                   + f" | cur_pmax {cur_pmax(step)} | skip {n_skipped}"
