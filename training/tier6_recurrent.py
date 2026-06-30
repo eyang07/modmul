@@ -106,7 +106,11 @@ def digits_msb(n: int, base: int) -> list[int]:
 _MR_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
-def _is_prime(n: int) -> bool:
+def _is_prime(n: int, rng: random.Random | None = None) -> bool:
+    """Miller-Rabin. The fixed witness set is only DETERMINISTIC for n < 3.3e24, so for
+    the large tier-6+ ranges (n up to 2^256+) we add 24 random-base rounds -> false-positive
+    probability < 4^-24 ~ 1e-14. (Without this, build_prime_pool returns composites at
+    256-bit, which silently poison training/eval; the scorer itself uses real sympy primes.)"""
     if n < 2:
         return False
     for sp in _MR_WITNESSES:
@@ -115,7 +119,11 @@ def _is_prime(n: int) -> bool:
     d, r = n - 1, 0
     while d % 2 == 0:
         d //= 2; r += 1
-    for a in _MR_WITNESSES:
+    bases = list(_MR_WITNESSES)
+    if n >= (1 << 81):                       # beyond the deterministic guarantee
+        rr = rng or random
+        bases += [rr.randrange(2, n - 1) for _ in range(24)]
+    for a in bases:
         x = pow(a, d, n)
         if x in (1, n - 1):
             continue
@@ -278,8 +286,11 @@ def eval_exact(model, primes, base, n, op_bits, rng, device, chunk=128):
         p = primes[rng.randrange(len(primes))]
         a = rng.randrange(1 << op_bits)
         b = rng.randrange(1 << op_bits)
-        x = a % p
-        items.append((x, b, p, (a * b) % p))
+        # Reduce BOTH operands per-argument, exactly as the submission does:
+        # (a*b) % p == ((a%p) * (b%p)) % p, and reducing b shortens the Horner chain
+        # to ~len(p) steps (the deployment regime) instead of ~op_bits steps.
+        x, b_red = a % p, b % p
+        items.append((x, b_red, p, (a * b) % p))
     Lb = max(len(digits_msb(b, base)) for _, b, _, _ in items)
     for s0 in range(0, n, chunk):
         sub = items[s0:s0 + chunk]
