@@ -124,6 +124,85 @@ def run_parity(args, device, amp_ctx):
     return mism == 0
 
 
+@torch.no_grad()
+def run_logitparity(args, device, amp_ctx):
+    """Teacher-forced LOGIT parity -- the weight-independent correctness test.
+
+    Argmax token streams (run_parity) are fragile under random init: near-tied logits
+    flip on tiny cache-vs-full-forward rounding, so a random model FAILS even when the
+    cache math is exact. Here we instead run decode_cached while recording, per step,
+    the raw logit row it emits and the (token, abacus) it commits; then re-run the
+    full-forward model.forward over that SAME reconstructed (toks, abac) and compare
+    logits position-by-position. The cache is correct iff max|Delta logit| is at the
+    arithmetic floor (fp32 ~1e-3; bf16 ~O(0.1-1) precision, which a trained model's
+    large margins absorb). argmax-agree is reported too but is the tie-sensitive metric.
+    """
+    model, V, base, max_len, abacus_max = build_model(args, device)
+    specials_t = torch.tensor(sorted(V["SPECIALS"]), device=device)
+    rng = random.Random(args.seed)
+    samples = make_prompts(args.n, base, V, args.p_min, args.p_max, rng)
+    chunks = chunked_by_len(samples, args.chunk)
+    layers = model.transformer.layers
+
+    max_abs, sum_abs, agree, tot = 0.0, 0.0, 0, 0
+    margin_lt_delta = 0
+    with amp_ctx:
+        for idxs in chunks:
+            toks0 = torch.tensor([samples[i][0] for i in idxs], dtype=torch.long, device=device)
+            abac0 = torch.tensor([samples[i][1] for i in idxs], dtype=torch.long, device=device)
+            B, T0 = toks0.shape
+            # --- cached pass: record each emitted logit + the (tok, abac) committed ---
+            h = (model.tok_emb(toks0) + model.pos_emb(model.pos_ids[:T0])
+                 + model.abacus_emb(abac0))
+            pk = [None] * len(layers); pv = [None] * len(layers)
+            for li, layer in enumerate(layers):
+                h, pk[li], pv[li] = _sdpa_layer_step(layer, h, None, None)
+            logit = model.head(model.ln(h[:, -1]))     # predicts token at abs pos T0
+            full_toks, full_abac = [toks0], [abac0]
+            clog, cpos = [logit], [T0]
+            nxt = logit.argmax(-1)
+            seg = torch.zeros(B, dtype=torch.long, device=device)
+            place, steps = T0, 0
+            while place < max_len - 1 and steps < args.steps_cap:
+                is_special = (nxt.unsqueeze(1) == specials_t).any(1)
+                new_abac = torch.where(is_special, torch.zeros_like(seg),
+                                       torch.clamp(seg, max=abacus_max - 1))
+                seg = torch.where(is_special, torch.zeros_like(seg), seg + 1)
+                full_toks.append(nxt.unsqueeze(1)); full_abac.append(new_abac.unsqueeze(1))
+                h = (model.tok_emb(nxt) + model.pos_emb(model.pos_ids[place])
+                     + model.abacus_emb(new_abac)).unsqueeze(1)
+                for li, layer in enumerate(layers):
+                    h, pk[li], pv[li] = _sdpa_layer_step(layer, h, pk[li], pv[li])
+                logit = model.head(model.ln(h[:, -1]))  # predicts token at abs pos place+1
+                clog.append(logit); cpos.append(place + 1)
+                nxt = logit.argmax(-1)
+                place += 1; steps += 1
+            # --- reference: full-forward over the reconstructed sequence ---
+            ft, fa = torch.cat(full_toks, dim=1), torch.cat(full_abac, dim=1)
+            ref = model(ft, fa)                          # ref[:, i] predicts token i+1
+            for logit, p in zip(clog, cpos):
+                rl = ref[:, p - 1]
+                d = (logit.float() - rl.float()).abs()
+                max_abs = max(max_abs, d.max().item())
+                sum_abs += d.mean().item()
+                agree += (logit.argmax(-1) == rl.argmax(-1)).sum().item()
+                # margin of the reference (gap between top-1 and top-2 logit)
+                top2 = rl.float().topk(2, dim=-1).values
+                margin = (top2[:, 0] - top2[:, 1])
+                margin_lt_delta += (margin < d.max(dim=-1).values).sum().item()
+                tot += logit.shape[0]
+    mean_abs = sum_abs / max(1, len(clog) * len(chunks))
+    print(f"\nLOGIT-PARITY ({'bf16' if (args.amp and device.type=='cuda') else 'fp32'}): "
+          f"max|Δlogit| = {max_abs:.3e} | mean|Δ| ≈ {mean_abs:.3e} over {tot} positions")
+    print(f"  argmax-agree {agree}/{tot} ({agree/max(1,tot):.4f}) "
+          f"| positions where ref-margin < Δ (i.e. a tie the cache 'could' flip): "
+          f"{margin_lt_delta}/{tot}")
+    ok = max_abs < args.tol
+    print(f"  gate(max|Δ| < tol={args.tol:g}): "
+          f"{'PASS -- cache numerically faithful' if ok else 'FAIL -- real divergence'}")
+    return ok
+
+
 def _answer(gen, base, V):
     if V["COLON"] not in gen:
         return None
@@ -201,7 +280,7 @@ def run_bench(args, device, amp_ctx):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["parity", "bench"])
+    ap.add_argument("mode", choices=["parity", "logitparity", "bench"])
     ap.add_argument("--ckpt", type=str, default="")
     ap.add_argument("--base", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=512)
@@ -218,6 +297,10 @@ def main() -> int:
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--also-nocache", action="store_true",
                     help="bench: also time the no-cache path to report the speedup")
+    ap.add_argument("--steps-cap", type=int, default=64,
+                    help="logitparity: max generated steps per chunk (keeps it fast)")
+    ap.add_argument("--tol", type=float, default=1e-2,
+                    help="logitparity: max|Δlogit| gate (fp32 floor ~1e-3; use larger for bf16)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -226,8 +309,12 @@ def main() -> int:
                if args.amp and device.type == "cuda" else contextlib.nullcontext())
     print(f"device {device} | amp {args.amp and device.type == 'cuda'}")
 
-    ok = run_parity(args, device, amp_ctx) if args.mode == "parity" \
-        else run_bench(args, device, amp_ctx)
+    if args.mode == "parity":
+        ok = run_parity(args, device, amp_ctx)
+    elif args.mode == "logitparity":
+        ok = run_logitparity(args, device, amp_ctx)
+    else:
+        ok = run_bench(args, device, amp_ctx)
     return 0 if ok else 1
 
 

@@ -264,10 +264,16 @@ class AbacusDecoder(nn.Module):
 
     def forward(self, toks, abacus):
         b, t = toks.shape
-        x = self.tok_emb(toks) + self.pos_emb(self.pos_ids[:t]) + self.abacus_emb(abacus)
-        mask = torch.triu(torch.full((t, t), float("-inf"), device=toks.device), diagonal=1)
-        x = self.transformer(x, mask=mask, is_causal=True)
-        return self.head(self.ln(x))
+        h = self.tok_emb(toks) + self.pos_emb(self.pos_ids[:t]) + self.abacus_emb(abacus)
+        # Flash/SDPA causal forward over the SAME trained layer weights. nn.TransformerEncoder
+        # with an explicit triu(-inf) float mask materializes the O(B*H*L^2) attention matrix
+        # (OOMs at tier-6 L=4347 on 24GB), and its is_causal hint is a no-op when mask=None
+        # (runs FULL, non-causal attention). _sdpa_layer_step uses F.scaled_dot_product_attention
+        # with is_causal=True (flash, no L^2 materialize) and matches the old masked path to
+        # ~1e-3 (validated by tier6_kvcache_probe logitparity). past_k/v=None => full prefill.
+        for layer in self.transformer.layers:
+            h, _, _ = _sdpa_layer_step(layer, h, None, None)
+        return self.head(self.ln(h))
 
 
 # ---------------------------------------------------------------------------
@@ -302,23 +308,9 @@ def eval_answer(model, primes, base, V, n, max_len, abacus_max, rng, device, chu
         g = len(idxs)
         toks = torch.tensor([samples[i][0] for i in idxs], dtype=torch.long, device=device)
         abac = torch.tensor([samples[i][1] for i in idxs], dtype=torch.long, device=device)
-        seg = torch.zeros(g, dtype=torch.long, device=device)
-        done = torch.zeros(g, dtype=torch.bool, device=device)
-        gen = [[] for _ in range(g)]
-        while toks.shape[1] < max_len and not bool(done.all()):
-            nxt = model(toks, abac)[:, -1].argmax(-1)
-            nxt = torch.where(done, torch.full_like(nxt, V["PAD"]), nxt)
-            is_special = (nxt.unsqueeze(1) == specials_t).any(1)
-            new_abac = torch.where(is_special, torch.zeros_like(seg),
-                                   torch.clamp(seg, max=abacus_max - 1))
-            seg = torch.where(is_special, torch.zeros_like(seg), seg + 1)
-            nxt_cpu, done_cpu = nxt.tolist(), done.tolist()
-            for j in range(g):
-                if not done_cpu[j] and nxt_cpu[j] != V["EOS"] and nxt_cpu[j] != V["PAD"]:
-                    gen[j].append(nxt_cpu[j])
-            toks = torch.cat([toks, nxt.unsqueeze(1)], dim=1)
-            abac = torch.cat([abac, new_abac.unsqueeze(1)], dim=1)
-            done = done | (nxt == V["EOS"])
+        # KV-cached greedy decode (P2-validated identical to the old inline nocache loop,
+        # ~8x faster). Critical at tier-6 L=4347: nocache eval was ~40min/eval -> unusable.
+        gen = decode_cached(model, toks, abac, max_len, abacus_max, specials_t, V)
         for j, i in enumerate(idxs):
             gj = gen[j]
             if V["COLON"] in gj:
