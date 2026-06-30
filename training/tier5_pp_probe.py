@@ -3,7 +3,7 @@ at a denser numeric base?
 
 Tier 5 is (a*b) mod p with p in [2^33, 2^64) (~20 decimal digits). In base-10 the
 Horner scratchpad is ~1700 tokens, which busts BOTH the chain-survival math and the
-300s decode budget (see PROJECT_STATE / memory/tier4-cracked). The fix is a denser
+300s decode budget (see CLAUDE.md / memory/tier4-cracked). The fix is a denser
 base B: base-100 -> ~700-token chain, base-1000 -> ~400. But a denser base makes the
 ONLY genuinely new sub-skill harder:
 

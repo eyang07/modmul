@@ -1,6 +1,6 @@
 """Composed tier-3 probe: multiply THEN reduce, end to end, in one model.
 
-Both halves are already proven independently (see PROJECT_STATE.md):
+Both halves are already proven independently (see CLAUDE.md):
   * multiply  (tier0_probe.py)  : LSB-first digit transformer, exact@5d ~0.98
   * reduce    (longdiv_probe.py): MSB-first long-division scratchpad, rem ~0.96
 
