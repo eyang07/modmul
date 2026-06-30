@@ -437,6 +437,106 @@ def _modmul_decode_base(model, cfg, xyp, device, base, chunk=64):
 
 
 # ---------------------------------------------------------------------------
+# Tier-6+ recurrent reduction cell (shared, weight-tied; tiers 6-10).
+#
+# A single learned cell computes ONE bounded digit-serial Horner step
+#   s_{t+1} = (s_t * B + d_t * x) mod p           (x = a mod p; d_t = base-B digits of b)
+# and forward() unrolls it over b's digits INSIDE the forward pass. Every s_t < p
+# (bounded state), and the cell is shared across all steps and all bit-widths, so it
+# length-generalizes from short training chains to tiers 6-10. The reduction is produced
+# entirely by trained parameters (randomizing weights collapses accuracy); the only
+# arithmetic in shipped code is the per-operand a%p / b%p reduction done BEFORE the cell
+# runs (same as the reference baselines) and the final base-B -> base-10 multiply-add.
+# Architecture copied verbatim from training/tier6_recurrent.py for state_dict match.
+# ---------------------------------------------------------------------------
+
+
+def _to_limbs(n: int, base: int, K: int) -> list[int]:
+    """Non-negative int -> K base-B limbs, LSB-first (zero-padded high)."""
+    out = [0] * K
+    i = 0
+    while n > 0 and i < K:
+        out[i] = n % base
+        n //= base
+        i += 1
+    return out
+
+
+def _from_limbs(limbs: list[int], base: int) -> int:
+    v = 0
+    for d in reversed(limbs):
+        v = v * base + int(d)        # multiply-add only; no %/// on the product
+    return v
+
+
+def _digits_msb_base(n: int, base: int) -> list[int]:
+    if n == 0:
+        return [0]
+    s = []
+    while n > 0:
+        s.append(n % base)
+        n //= base
+    return s[::-1]
+
+
+class RecurrentReducer(nn.Module):
+    def __init__(self, base, d_model=256, gru_layers=2, aux_quotient=True, q_max=None):
+        super().__init__()
+        self.base = base
+        self.aux_quotient = aux_quotient
+        self.q_max = q_max if q_max is not None else 2 * base
+        self.E_s = nn.Embedding(base, d_model)
+        self.E_x = nn.Embedding(base, d_model)
+        self.E_p = nn.Embedding(base, d_model)
+        self.E_d = nn.Embedding(base, d_model)
+        self.gru = nn.GRU(d_model, d_model, num_layers=gru_layers,
+                          batch_first=True, bidirectional=True)
+        self.ln = nn.LayerNorm(2 * d_model)
+        self.head = nn.Linear(2 * d_model, base)
+        if aux_quotient:
+            self.qhead = nn.Linear(2 * d_model, self.q_max)
+
+    def _encode(self, s, x, p, d):
+        h = self.E_s(s) + self.E_x(x) + self.E_p(p) + self.E_d(d).unsqueeze(1)
+        out, _ = self.gru(h)
+        return self.ln(out)
+
+    def step_logits(self, s, x, p, d):
+        return self.head(self._encode(s, x, p, d))
+
+    @torch.no_grad()
+    def forward(self, x, b_digits, p):
+        s = torch.zeros_like(x)
+        for t in range(b_digits.shape[1]):
+            s = self.step_logits(s, x, p, b_digits[:, t]).argmax(-1)
+        return s
+
+
+@torch.no_grad()
+def _recurrent_decode(model, base, items, device, chunk=64):
+    """Free-running (x*b_red) mod p == (a*b) mod p for each (x, b_red, p) with
+    x = a%p and b_red = b%p already in [0, p). Returns base-10 digit-lists (MSB-first)."""
+    out = [[0]] * len(items)
+    if not items:
+        return out
+    Kp = max(len(_digits_msb_base(p, base)) for _, _, p in items) + 1
+    Lb = max(len(_digits_msb_base(b, base)) for _, b, _ in items)
+    for s0 in range(0, len(items), chunk):
+        sub = items[s0:s0 + chunk]
+        X = torch.tensor([_to_limbs(x, base, Kp) for x, _, _ in sub],
+                         dtype=torch.long, device=device)
+        P = torch.tensor([_to_limbs(p, base, Kp) for _, _, p in sub],
+                         dtype=torch.long, device=device)
+        Bd = torch.tensor([[0] * (Lb - len(_digits_msb_base(b, base)))
+                           + _digits_msb_base(b, base) for _, b, _ in sub],
+                          dtype=torch.long, device=device)
+        s = model(X, Bd, P)
+        for j in range(len(sub)):
+            out[s0 + j] = int_to_decimal_digits(_from_limbs(s[j].tolist(), base))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Submission entry class
 # ---------------------------------------------------------------------------
 
@@ -451,6 +551,8 @@ class EBMModMul(ModularMultiplicationModel):
         self.mm4_cfg = None
         self.mm5 = None         # tier-5 base-16 modmul scratchpad
         self.mm5_cfg = None
+        self.mm6 = None         # tier-6+ recurrent reduction cell
+        self.mm6_cfg = None
 
     def load(self, model_dir: str) -> None:
         if torch.cuda.is_available():
@@ -498,6 +600,16 @@ class EBMModMul(ModularMultiplicationModel):
             ).to(self.device)
             self.mm5.load_state_dict(ckpt["tier5"]["state_dict"])
             self.mm5.eval()
+        # Tiers 6-10: the shared recurrent reduction cell (length-generalizes).
+        if "tier6" in ckpt:
+            c6 = ckpt["tier6"]["config"]
+            self.mm6_cfg = c6
+            self.mm6 = RecurrentReducer(
+                c6["base"], d_model=c6["d_model"], gru_layers=c6["gru_layers"],
+                aux_quotient=c6.get("aux_quotient", True),
+            ).to(self.device)
+            self.mm6.load_state_dict(ckpt["tier6"]["state_dict"])
+            self.mm6.eval()
 
     # Per-argument identity preprocessing (each hook sees only its own argument).
     def preprocess_a(self, a): return a
@@ -524,15 +636,21 @@ class EBMModMul(ModularMultiplicationModel):
         mm_items, mm_idx = [], []                                  # tier 3
         mm4_items, mm4_idx = [], []                                # tier 4
         mm5_items, mm5_idx = [], []                                # tier 5
+        mm6_items, mm6_idx = [], []                                # tiers 6-10
 
         for i, (a_enc, b_enc, p_enc) in enumerate(inputs):
             p = int(p_enc)
-            # Out of regime (residues don't fit the trained range): honest 0.
-            if p >= self.TIER5_HI:
-                out[i] = [0]
-                continue
             a_red = int(a_enc) % p          # per-operand reduction (allowed)
             b_red = int(b_enc) % p
+            if p >= self.TIER5_HI:
+                # Tiers 6-10: shared recurrent reduction cell. Horner over b_red's
+                # base-B digits with x=a_red keeps every intermediate < p; the cell
+                # length-generalizes across all bit-widths. Honest [0] if not bundled.
+                if self.mm6 is not None:
+                    mm6_items.append((a_red, b_red, p)); mm6_idx.append(i)
+                else:
+                    out[i] = [0]
+                continue
             if p >= self.TIER4_HI:
                 if self.mm5 is not None:
                     mm5_items.append((a_red, b_red, p)); mm5_idx.append(i)
@@ -589,6 +707,19 @@ class EBMModMul(ModularMultiplicationModel):
                 res = _modmul_decode_base(self.mm5, self.mm5_cfg, mm5_items,
                                           self.device, base=self.mm5_cfg["base"], chunk=64)
             for j, i in enumerate(mm5_idx):
+                out[i] = res[j]
+
+        if mm6_items:
+            # Tiers 6-10: free-running recurrent unroll, batched. bf16 on CUDA to match
+            # training precision and bound the long-chain memory/throughput.
+            if self.device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    res = _recurrent_decode(self.mm6, self.mm6_cfg["base"], mm6_items,
+                                            self.device)
+            else:
+                res = _recurrent_decode(self.mm6, self.mm6_cfg["base"], mm6_items,
+                                        self.device)
+            for j, i in enumerate(mm6_idx):
                 out[i] = res[j]
 
         return [o if o is not None else [0] for o in out]
