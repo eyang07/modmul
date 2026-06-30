@@ -25,8 +25,22 @@ import argparse
 import random
 
 import torch
+from sympy import nextprime
 
 import tier6_recurrent as M
+
+
+def _primes(lo, hi, n, rng):
+    """Real primes drawn like the official scorer: nextprime of a value-uniform draw
+    in [lo, hi) (modchallenge.testgen.primes). Avoids tier6_recurrent.build_prime_pool,
+    whose log-uniform start + (historically) weak primality test gives a different,
+    off-distribution set than what the model is actually graded on."""
+    out = set()
+    while len(out) < n:
+        p = int(nextprime(rng.randrange(lo, hi)))
+        if p < hi:
+            out.add(p)
+    return sorted(out)
 
 
 def load_model(ckpt_path, device):
@@ -41,7 +55,7 @@ def load_model(ckpt_path, device):
 
 def check_weight_perturbation(model, cfg, device, n=200, bits=128, seed=0):
     base = cfg["base"]
-    ps = M.build_prime_pool(1 << (bits - 1), 1 << bits, 400, random.Random(bits))
+    ps = _primes(1 << (bits - 1), 1 << bits, 400, random.Random(bits))
     real = M.eval_exact(model, ps, base, n, 2 * bits, random.Random(seed), device)
     pert = M.RecurrentReducer(base, d_model=cfg["d_model"], gru_layers=cfg["gru_layers"],
                               aux_quotient=cfg.get("aux_quotient", True)).to(device)
@@ -61,7 +75,7 @@ def check_no_shortcut(model, cfg, device, n=500, bits=128, seed=1):
     """Predictions must equal (a*b)%p and not coincide with the shortcuts. We only
     count problems where the shortcuts genuinely differ from the true answer."""
     base = cfg["base"]
-    ps = M.build_prime_pool(1 << (bits - 1), 1 << bits, 400, random.Random(bits + 1))
+    ps = _primes(1 << (bits - 1), 1 << bits, 400, random.Random(bits + 1))
     rng = random.Random(seed)
     Kp = max(len(M.digits_msb(p, base)) for p in ps) + 1
     items = []
@@ -134,7 +148,7 @@ def check_exhaustive(model, cfg, device, limit=64):
 @torch.no_grad()
 def check_adversarial(model, cfg, device, bits=128, seed=2):
     base = cfg["base"]
-    ps = M.build_prime_pool(1 << (bits - 1), 1 << bits, 200, random.Random(bits + 2))
+    ps = _primes(1 << (bits - 1), 1 << bits, 200, random.Random(bits + 2))
     rng = random.Random(seed)
     cases = []
     # edge operands
@@ -170,7 +184,7 @@ def check_adversarial(model, cfg, device, bits=128, seed=2):
 @torch.no_grad()
 def check_bf16_margin(model, cfg, device, n=400, bits=128, seed=3):
     base = cfg["base"]
-    ps = M.build_prime_pool(1 << (bits - 1), 1 << bits, 400, random.Random(bits + 3))
+    ps = _primes(1 << (bits - 1), 1 << bits, 400, random.Random(bits + 3))
     S, X, P, D, _, _ = M.make_batch(n, ps, base,
                                     len(M.digits_msb((1 << bits) - 1, base)) + 1,
                                     random.Random(seed), device)
