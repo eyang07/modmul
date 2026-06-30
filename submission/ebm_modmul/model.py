@@ -628,6 +628,11 @@ class EBMModMul(ModularMultiplicationModel):
     TIER3_HI = 65536
     TIER4_HI = 2 ** 32
     TIER5_HI = 2 ** 64
+    # The recurrent cell handles tiers 6-7 (p < 2^256) accurately AND within budget.
+    # For p >= 2^256 (tiers 8-10) and tier-0's huge-p multiplications, the Horner chain
+    # would be thousands of steps and eat the whole 300s budget (starving later tiers),
+    # so we emit a fast [0] instead. This cap is what keeps the full 1100-set under 300s.
+    TIER7_HI = 2 ** 256
 
     @torch.no_grad()
     def predict_digits_batch(self, inputs):
@@ -642,21 +647,21 @@ class EBMModMul(ModularMultiplicationModel):
             p = int(p_enc)
             a_red = int(a_enc) % p          # per-operand reduction (allowed)
             b_red = int(b_enc) % p
-            if p >= self.TIER5_HI:
-                # Tiers 6-10: shared recurrent reduction cell. Horner over b_red's
-                # base-B digits with x=a_red keeps every intermediate < p; the cell
-                # length-generalizes across all bit-widths. Honest [0] if not bundled.
-                if self.mm6 is not None:
-                    mm6_items.append((a_red, b_red, p)); mm6_idx.append(i)
-                else:
-                    out[i] = [0]
-                continue
             if p >= self.TIER4_HI:
-                if self.mm5 is not None:
+                # Tiers 5-7: the recurrent reduction cell (p in [2^32, 2^256)), CAPPED at
+                # p < 2^256 so the Horner chain over b_red stays bounded (<=256 steps);
+                # beyond that emit a fast [0] (budget protection -- see TIER7_HI). The cell
+                # subsumes the old base-16 tier-5 scratchpad (a ~0.6 coin flip) at ~1.0 and
+                # adds tiers 6-7. Falls back to the base-16 scratchpad for tier 5 only if
+                # the cell isn't bundled.
+                if self.mm6 is not None and p < self.TIER7_HI:
+                    mm6_items.append((a_red, b_red, p)); mm6_idx.append(i)
+                elif p < self.TIER5_HI and self.mm5 is not None:
                     mm5_items.append((a_red, b_red, p)); mm5_idx.append(i)
                 else:
                     out[i] = [0]
-            elif p >= self.TIER3_HI:
+                continue
+            if p >= self.TIER3_HI:
                 if self.mm4 is not None:
                     mm4_items.append((a_red, b_red, p)); mm4_idx.append(i)
                 else:
